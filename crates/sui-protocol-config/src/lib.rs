@@ -376,6 +376,9 @@ const MAINNET_USDB: &str =
 // Version 133: Include function signatures in type-node limits.
 //              Bound type nodes in accumulators.
 // Version 134: Add `package::original_package_id` and its native costs.
+//              Enable ptb_tx_context_restrictions: `TxContext` may appear in a
+//              PTB Move call signature at most once mutably or any number of
+//              times immutably (never by value), and never in return position.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -1044,6 +1047,13 @@ struct FeatureFlags {
     // Count function and local signatures towards type-node budgets.
     #[serde(skip_serializing_if = "is_false")]
     include_function_signatures_in_instantiation_limits: bool,
+
+    // If true, the static PTB verifier restricts `TxContext` in Move call
+    // signatures: it may appear at most once as `&mut TxContext`, or any
+    // number of times as `&TxContext`, never by value, and never in return
+    // position (it can never become a PTB result).
+    #[serde(skip_serializing_if = "is_false")]
+    ptb_tx_context_restrictions: bool,
 
     // Enable display registry protocol
     #[serde(skip_serializing_if = "is_false")]
@@ -4583,6 +4593,7 @@ impl ProtocolConfig {
                     let package_read_cost_per_byte = cfg.obj_access_cost_read_per_byte();
                     cfg.package_original_package_id_impl_cost_per_byte =
                         Some(package_read_cost_per_byte);
+                    cfg.feature_flags.ptb_tx_context_restrictions = true;
                 }
                 // Use this template when making changes:
                 //
