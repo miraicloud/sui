@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 133;
+const MAX_PROTOCOL_VERSION: u64 = 134;
 
 const TESTNET_USDC: &str =
     "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC";
@@ -374,6 +374,7 @@ const MAINNET_USDB: &str =
 //              Create the ForwardingAddressRegistry system object on devnet.
 //              Make upgrade-init linkage checks independent of PTB command order.
 // Version 133: Add `package::original_package_id` and its native costs.
+// Version 134: Enable check_object_funds_withdraw_in_execution on devnet and charge for cold reads.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -1734,6 +1735,10 @@ pub struct ProtocolConfig {
     event_emit_output_cost_per_byte: Option<u64>,
     event_emit_auth_stream_cost: Option<u64>,
 
+    // `funds_accumulator` module
+    // Cost of loading an object's settled balance on the first withdrawal for an owner and type.
+    reserve_object_funds_for_withdrawal_cold_read_cost: Option<u64>,
+
     //  `object` module
     // Cost params for the Move native function `borrow_uid<T: key>(obj: &T): &UID`
     object_borrow_uid_cost_base: Option<u64>,
@@ -2641,6 +2646,9 @@ impl ProtocolConfig {
             event_emit_tag_size_derivation_cost_per_byte: Some(5),
             event_emit_output_cost_per_byte: Some(10),
             event_emit_auth_stream_cost: None,
+
+            // `funds_accumulator` module: introduced in protocol version 134.
+            reserve_object_funds_for_withdrawal_cold_read_cost: None,
 
             //  `object` module
             // Cost params for the Move native function `borrow_uid<T: key>(obj: &T): &UID`
@@ -4561,7 +4569,6 @@ impl ProtocolConfig {
                     if chain != Chain::Mainnet && chain != Chain::Testnet {
                         cfg.feature_flags.defer_owned_object_double_spend = true;
                         cfg.feature_flags.create_forwarding_address_registry = true;
-                        cfg.feature_flags.check_object_funds_withdraw_in_execution = true;
                     }
                     cfg.object_record_new_uid_from_hash_cost_base = Some(1);
                     cfg.feature_flags
@@ -4572,6 +4579,14 @@ impl ProtocolConfig {
                     let package_read_cost_per_byte = cfg.obj_access_cost_read_per_byte();
                     cfg.package_original_package_id_impl_cost_per_byte =
                         Some(package_read_cost_per_byte);
+                }
+                134 => {
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.check_object_funds_withdraw_in_execution = true;
+                    }
+                    // Equivalent to the fixed portion of a dynamic-field lookup (52 + 52) plus
+                    // loading the 80-byte accumulator field contents at one gas unit per byte.
+                    cfg.reserve_object_funds_for_withdrawal_cold_read_cost = Some(184);
                 }
                 // Use this template when making changes:
                 //
