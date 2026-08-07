@@ -1228,7 +1228,12 @@ async fn start(
                 database_url.clone(),
                 fullnode_args,
                 DbArgs::default(),
-                KvArgs::default(),
+                KvArgs {
+                    // Package resolution requires a ledger gRPC service, which can be served by a
+                    // fullnode.
+                    ledger_grpc_url: Some(format!("http://{fullnode_rpc_address}").parse()?),
+                    ..Default::default()
+                },
                 consistent_reader_args,
                 graphql_args,
                 SystemPackageTaskArgs::default(),

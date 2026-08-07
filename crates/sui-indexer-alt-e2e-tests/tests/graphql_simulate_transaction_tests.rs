@@ -191,7 +191,15 @@ impl GraphQlTestCluster {
             Some(database_url),
             fullnode_args,
             DbArgs::default(),
-            KvArgs::default(),
+            KvArgs {
+                ledger_grpc_url: Some(
+                    validator_cluster
+                        .rpc_url()
+                        .parse()
+                        .expect("Invalid ledger gRPC URL"),
+                ),
+                ..Default::default()
+            },
             ConsistentReaderArgs::default(),
             GraphQlArgs {
                 rpc_listen_address: graphql_listen_address,

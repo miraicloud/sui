@@ -130,7 +130,15 @@ impl GraphQlTestCluster {
             None, // No database - GraphQL will use fullnode RPC for executeTransaction
             fullnode_args,
             DbArgs::default(),
-            KvArgs::default(),
+            KvArgs {
+                ledger_grpc_url: Some(
+                    validator_cluster
+                        .rpc_url()
+                        .parse()
+                        .expect("Invalid ledger gRPC URL"),
+                ),
+                ..Default::default()
+            },
             ConsistentReaderArgs::default(),
             graphql_args,
             SystemPackageTaskArgs::default(),
