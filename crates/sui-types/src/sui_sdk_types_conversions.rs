@@ -853,6 +853,10 @@ impl From<crate::execution_status::CommandArgumentError> for CommandArgumentErro
                 Self::CannotWriteToExtendedReference,
             crate::execution_status::CommandArgumentError::InvalidReferenceArgument =>
                 Self::InvalidReferenceArgument,
+            // The SDK does not yet have an `InvalidTxContext` variant; map to the closest
+            // existing error until it is added upstream.
+            crate::execution_status::CommandArgumentError::InvalidTxContext =>
+                Self::TypeMismatch,
         }
     }
 }
