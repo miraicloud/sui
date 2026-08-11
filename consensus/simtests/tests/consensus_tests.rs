@@ -327,6 +327,62 @@ mod consensus_tests {
         load_handle.abort();
     }
 
+    // Restart one validator as a new process without its local store. The new process must
+    // recover its last own block from peers before it proposes another block.
+    #[sim_test(config = "test_config()")]
+    async fn test_consensus_restart_with_empty_store() {
+        telemetry_subscribers::init_for_testing();
+        let db_registry = Registry::new();
+        DBMetrics::init(RegistryService::new(db_registry));
+        const NUM_OF_AUTHORITIES: usize = 4;
+        const RESTARTED_AUTHORITY: usize = 0;
+        let (committee, keypairs) = local_committee_and_keys(0, [1; NUM_OF_AUTHORITIES].to_vec());
+        let mut protocol_config = ConsensusProtocolConfig::for_testing();
+        protocol_config.set_gc_depth_for_testing(3);
+
+        let authorities = start_committee(
+            &committee,
+            &keypairs,
+            &protocol_config,
+            &[0; NUM_OF_AUTHORITIES],
+            Arc::new(NoopTransactionVerifier {}),
+            |_, _| {},
+        )
+        .await;
+
+        sleep(Duration::from_secs(10)).await;
+        let authority = &authorities[RESTARTED_AUTHORITY];
+        let commit_index_before_restart =
+            authority.commit_consumer_monitor().highest_handled_commit();
+        assert!(
+            commit_index_before_restart > 0,
+            "Authority {RESTARTED_AUTHORITY} made no commits before restart"
+        );
+
+        authority.stop().await;
+        authority.start_with_empty_store().await.unwrap();
+        authority.spawn_committed_subdag_consumer().unwrap();
+
+        // Catch-up from an empty store is paced by commit sync. Poll until the validator
+        // passes its pre-restart commit index.
+        let progressed = timeout(Duration::from_secs(120), async {
+            loop {
+                if authority.commit_consumer_monitor().highest_handled_commit()
+                    > commit_index_before_restart
+                {
+                    return;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            progressed.is_ok(),
+            "Authority {RESTARTED_AUTHORITY} did not pass its pre-restart commit index \
+             {commit_index_before_restart} within 120s after an empty-store restart"
+        );
+    }
+
     // Tests consensus transaction voting with randomized votes and random crashes. The test
     // creates a fixed number of transactions, sends them to random authorities, and randomizes
     // votes on them (accept or reject), while authorities randomly crash and restart under the
