@@ -104,10 +104,11 @@ pub struct ResolvedRange {
     pub entry_checkpoint: u64,
     /// The tx-sequence bound the scan *reports* when the interval is
     /// exhausted (the terminal frame's cursor coordinate, paired with
-    /// `end_checkpoint`). Tracks the scan-direction edge of `range`
-    /// (`range.end` ascending, `range.start` descending) as cursor bounds
-    /// tighten it, but stays pinned to the reported bound if the backend
-    /// further clamps `range` to available history.
+    /// `end_checkpoint`). Range-derived until a cursor wins the terminal
+    /// edge, after which it stores the cursor's RAW coordinate — those
+    /// stamps set `CursorBound` and are never emitted as terminal frames,
+    /// so the convention is not wire-visible. Stays pinned to the reported
+    /// bound if the backend further clamps `range` to available history.
     pub end_position: u64,
     /// Why the interval is exhausted once the scan drains it.
     pub exhaustion: RangeExhaustion,
@@ -153,6 +154,28 @@ pub struct CheckpointRange {
     end: u64,
     high_exhaustion: RangeExhaustion,
     indexed_tip: u64,
+}
+
+/// A cursor decoded into a lane's coordinate space for bound application:
+/// the raw coordinate and kind feed terminal bookkeeping; `bound` is the
+/// lane-resolved constraint the cursor imposes on the scan window (`after`
+/// cursors carry a lower bound, `before` cursors an upper bound).
+struct DecodedCursor<P> {
+    kind: sui_rpc_cursor::CursorKind,
+    checkpoint: u64,
+    position: P,
+    bound: Bound<P>,
+}
+
+/// Cursor-clamped scan state shared by the scalar and event lanes.
+struct BoundedScan<P> {
+    lo: Bound<P>,
+    hi: Bound<P>,
+    entry_checkpoint: u64,
+    end_checkpoint: u64,
+    end_position: P,
+    exhaustion: RangeExhaustion,
+    empty: bool,
 }
 
 impl EventPosition {
@@ -286,96 +309,64 @@ impl QueryOptions {
             return resolved;
         }
 
-        let mut start = resolved.range.start;
-        let mut end = resolved.range.end;
-        let mut end_checkpoint = resolved.end_checkpoint;
-        let mut end_position = resolved.end_position;
-        let mut exhaustion = resolved.exhaustion;
-        let mut entry_checkpoint = resolved.entry_checkpoint;
-        let mut cursor_terminal = None;
-
-        if let Some(cursor) = &self.after {
+        // The scalar lane resolves an Item's exclusion eagerly: dense integer
+        // coordinates have a computable successor, so `Excluded(N)` becomes
+        // `Included(N + 1)` before bound application. `u64::MAX` has no
+        // successor — it is the unoccupiable exclusive sentinel of these
+        // packed ranges (a real item at MAX could not be represented by the
+        // required exclusive end) — so its exclusion stays symbolic, which
+        // collapses any window above it.
+        let scalar_lo = |bound: Bound<u64>| match bound {
+            Bound::Excluded(position) => match position.checked_add(1) {
+                Some(successor) => Bound::Included(successor),
+                None => Bound::Excluded(position),
+            },
+            other => other,
+        };
+        let after = self.after.as_ref().map(|cursor| {
             let position = u64_cursor_position(cursor);
-            if matches!(self.ordering, Ordering::Ascending) {
-                entry_checkpoint = entry_checkpoint.max(cursor.position.checkpoint());
+            DecodedCursor {
+                kind: cursor.kind,
+                checkpoint: cursor.position.checkpoint(),
+                position,
+                bound: scalar_lo(cursor.kind.resume_bound(position)),
             }
-            let Some(after) = cursor.kind.fencepost(position) else {
-                // `u64::MAX` is the unoccupiable exclusive sentinel of these
-                // packed ranges (a real item at MAX could not be represented by
-                // the required exclusive end). A Boundary cursor at MAX is
-                // therefore equivalent to the overflowing Item successor and
-                // cannot re-deliver an item.
-                return ResolvedRange {
-                    entry_checkpoint,
-                    ..ResolvedRange::empty_at(
-                        cursor.position.checkpoint(),
-                        position,
-                        RangeExhaustion::CursorBound {
-                            kind: sui_rpc_cursor::CursorKind::Boundary,
-                        },
-                    )
-                };
-            };
-            if after >= start {
-                start = after;
-                if matches!(self.ordering, Ordering::Descending) || after >= end {
-                    cursor_terminal = Some((cursor.position.checkpoint(), after));
-                }
-                if matches!(self.ordering, Ordering::Descending) {
-                    end_checkpoint = cursor.position.checkpoint();
-                    end_position = after;
-                    exhaustion = RangeExhaustion::CursorBound {
-                        kind: sui_rpc_cursor::CursorKind::Boundary,
-                    };
-                }
-            }
-        }
-
-        if let Some(cursor) = &self.before {
+        });
+        let before = self.before.as_ref().map(|cursor| {
             let position = u64_cursor_position(cursor);
-            if matches!(self.ordering, Ordering::Descending) {
-                entry_checkpoint = entry_checkpoint.min(cursor.position.checkpoint());
+            DecodedCursor {
+                kind: cursor.kind,
+                checkpoint: cursor.position.checkpoint(),
+                position,
+                bound: cursor.kind.limit_bound(position),
             }
-            if position <= end {
-                end = position;
-                if matches!(self.ordering, Ordering::Ascending) || position <= start {
-                    cursor_terminal = Some((cursor.position.checkpoint(), position));
-                }
-                if matches!(self.ordering, Ordering::Ascending) {
-                    end_checkpoint = cursor.position.checkpoint();
-                    end_position = position;
-                    exhaustion = RangeExhaustion::CursorBound {
-                        kind: sui_rpc_cursor::CursorKind::Boundary,
-                    };
-                }
-            }
-        }
+        });
 
-        if start >= end {
-            if let Some((checkpoint, position)) = cursor_terminal {
-                end_checkpoint = checkpoint;
-                end_position = position;
-            }
-            if self.after.is_some() || self.before.is_some() {
-                exhaustion = RangeExhaustion::CursorBound {
-                    kind: sui_rpc_cursor::CursorKind::Boundary,
-                };
-            }
-            ResolvedRange {
-                range: end_position..end_position,
-                end_checkpoint,
-                end_position,
-                exhaustion,
-                entry_checkpoint,
-            }
-        } else {
-            ResolvedRange {
-                range: start..end,
-                end_checkpoint,
-                end_position,
-                exhaustion,
-                entry_checkpoint,
-            }
+        let scan = apply_cursor_bounds_core(
+            self.ordering,
+            after,
+            before,
+            BoundedScan {
+                lo: Bound::Included(resolved.range.start),
+                hi: Bound::Excluded(resolved.range.end),
+                entry_checkpoint: resolved.entry_checkpoint,
+                end_checkpoint: resolved.end_checkpoint,
+                end_position: resolved.end_position,
+                exhaustion: resolved.exhaustion,
+                empty: false,
+            },
+        );
+
+        ResolvedRange {
+            range: if scan.empty {
+                scan.end_position..scan.end_position
+            } else {
+                scalar_range(scan.lo, scan.hi)
+            },
+            end_checkpoint: scan.end_checkpoint,
+            end_position: scan.end_position,
+            exhaustion: scan.exhaustion,
+            entry_checkpoint: scan.entry_checkpoint,
         }
     }
 
@@ -384,95 +375,56 @@ impl QueryOptions {
             return resolved;
         }
 
-        let mut bounds = resolved.bounds;
-        let mut end_checkpoint = resolved.end_checkpoint;
-        let mut end_position = resolved.end_position;
-        let mut exhaustion = resolved.exhaustion;
-        let mut entry_checkpoint = resolved.entry_checkpoint;
-        let mut cursor_terminal = None;
-
-        if let Some(cursor) = &self.after {
+        // The event lane cannot resolve an Item's exclusion: the successor
+        // of an event coordinate is a data fact, not arithmetic. `Excluded`
+        // stays symbolic for the store to resolve.
+        let after = self.after.as_ref().map(|cursor| {
             let position = event_cursor_position(cursor);
-            if matches!(self.ordering, Ordering::Ascending) {
-                entry_checkpoint = entry_checkpoint.max(cursor.position.checkpoint());
+            DecodedCursor {
+                kind: cursor.kind,
+                checkpoint: cursor.position.checkpoint(),
+                position,
+                bound: cursor.kind.resume_bound(position),
             }
-            let candidate = cursor.kind.resume_bound(position);
-            if lower_bound_gte(candidate, bounds.lo) {
-                bounds.lo = candidate;
-                if matches!(self.ordering, Ordering::Descending) || bounds.is_empty() {
-                    let kind = if matches!(self.ordering, Ordering::Ascending) {
-                        cursor.kind
-                    } else {
-                        sui_rpc_cursor::CursorKind::Boundary
-                    };
-                    cursor_terminal = Some((cursor.position.checkpoint(), position, kind));
-                }
-                if matches!(self.ordering, Ordering::Descending) {
-                    end_checkpoint = cursor.position.checkpoint();
-                    end_position = position;
-                    exhaustion = RangeExhaustion::CursorBound {
-                        kind: sui_rpc_cursor::CursorKind::Boundary,
-                    };
-                }
-            }
-        }
-
-        if let Some(cursor) = &self.before {
+        });
+        let before = self.before.as_ref().map(|cursor| {
             let position = event_cursor_position(cursor);
-            if matches!(self.ordering, Ordering::Descending) {
-                entry_checkpoint = entry_checkpoint.min(cursor.position.checkpoint());
+            DecodedCursor {
+                kind: cursor.kind,
+                checkpoint: cursor.position.checkpoint(),
+                position,
+                bound: cursor.kind.limit_bound(position),
             }
-            if hi_admits_upper_bound(bounds.hi, position) {
-                bounds.hi = cursor.kind.limit_bound(position);
-                if matches!(self.ordering, Ordering::Ascending) || bounds.is_empty() {
-                    cursor_terminal = Some((
-                        cursor.position.checkpoint(),
-                        position,
-                        sui_rpc_cursor::CursorKind::Boundary,
-                    ));
-                }
-                if matches!(self.ordering, Ordering::Ascending) {
-                    end_checkpoint = cursor.position.checkpoint();
-                    end_position = position;
-                    exhaustion = RangeExhaustion::CursorBound {
-                        kind: sui_rpc_cursor::CursorKind::Boundary,
-                    };
-                }
-            }
-        }
+        });
 
-        // CursorBound bookkeeping records the exact event coordinate at which
-        // the resolved interval terminates. Nonempty intervals terminate at the
-        // ordering-side cursor boundary. An ascending interval made empty by an
-        // `after` Item cursor must retain Item kind: converting that raw
-        // coordinate to Boundary would re-include the item on resume. This also
-        // avoids inventing a lexicographic successor when the event coordinate
-        // is already maximal.
-        if bounds.is_empty() {
-            if let Some((checkpoint, position, kind)) = cursor_terminal {
-                end_checkpoint = checkpoint;
-                end_position = position;
-                exhaustion = RangeExhaustion::CursorBound { kind };
-            } else if self.after.is_some() || self.before.is_some() {
-                exhaustion = RangeExhaustion::CursorBound {
-                    kind: sui_rpc_cursor::CursorKind::Boundary,
-                };
-            }
-            ResolvedEventRange {
-                bounds: EventScanBounds::empty_at(end_position),
-                end_checkpoint,
-                end_position,
-                exhaustion,
-                entry_checkpoint,
-            }
-        } else {
-            ResolvedEventRange {
-                bounds,
-                end_checkpoint,
-                end_position,
-                exhaustion,
-                entry_checkpoint,
-            }
+        let scan = apply_cursor_bounds_core(
+            self.ordering,
+            after,
+            before,
+            BoundedScan {
+                lo: resolved.bounds.lo,
+                hi: resolved.bounds.hi,
+                entry_checkpoint: resolved.entry_checkpoint,
+                end_checkpoint: resolved.end_checkpoint,
+                end_position: resolved.end_position,
+                exhaustion: resolved.exhaustion,
+                empty: false,
+            },
+        );
+
+        ResolvedEventRange {
+            bounds: if scan.empty {
+                EventScanBounds::empty_at(scan.end_position)
+            } else {
+                EventScanBounds {
+                    lo: scan.lo,
+                    hi: scan.hi,
+                }
+            },
+            end_checkpoint: scan.end_checkpoint,
+            end_position: scan.end_position,
+            exhaustion: scan.exhaustion,
+            entry_checkpoint: scan.entry_checkpoint,
         }
     }
 }
@@ -581,13 +533,7 @@ impl EventScanBounds {
     }
 
     pub fn is_empty(&self) -> bool {
-        match (self.lo, self.hi) {
-            (Bound::Included(a), Bound::Excluded(b))
-            | (Bound::Excluded(a), Bound::Excluded(b))
-            | (Bound::Excluded(a), Bound::Included(b)) => a >= b,
-            (Bound::Included(a), Bound::Included(b)) => a > b,
-            (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-        }
+        bounds_empty(self.lo, self.hi)
     }
 
     pub fn contains(&self, position: EventPosition) -> bool {
@@ -811,6 +757,119 @@ impl From<(u64, u32)> for EventPosition {
     }
 }
 
+/// The one cursor-bound application, shared by every lane. Clamps the window
+/// by the cursors' lane-resolved bounds and attributes terminal metadata: a
+/// terminal-edge winner (descending `after`, ascending `before`) supplies
+/// the end coordinates of a nonempty window; a cursor-collapsed window
+/// reports the last-recorded winner. Terminal stamps store the cursor's RAW
+/// coordinate and preserve its kind — an ascending window emptied by an
+/// `after` Item must echo Item, or resume would re-include the delivered
+/// row, and an event coordinate has no lexicographic successor to adjust
+/// to. These stamps set `CursorBound`, which is never emitted as a terminal
+/// frame, so stamp conventions are not wire-visible.
+fn apply_cursor_bounds_core<P: Copy + Ord>(
+    ordering: Ordering,
+    after: Option<DecodedCursor<P>>,
+    before: Option<DecodedCursor<P>>,
+    mut scan: BoundedScan<P>,
+) -> BoundedScan<P> {
+    let mut cursor_terminal = None;
+
+    if let Some(cursor) = &after {
+        if matches!(ordering, Ordering::Ascending) {
+            scan.entry_checkpoint = scan.entry_checkpoint.max(cursor.checkpoint);
+        }
+        if lower_bound_gte(cursor.bound, scan.lo) {
+            scan.lo = cursor.bound;
+            if matches!(ordering, Ordering::Descending) || bounds_empty(scan.lo, scan.hi) {
+                let kind = if matches!(ordering, Ordering::Ascending) {
+                    cursor.kind
+                } else {
+                    sui_rpc_cursor::CursorKind::Boundary
+                };
+                cursor_terminal = Some((cursor.checkpoint, cursor.position, kind));
+            }
+            if matches!(ordering, Ordering::Descending) {
+                scan.end_checkpoint = cursor.checkpoint;
+                scan.end_position = cursor.position;
+                scan.exhaustion = RangeExhaustion::CursorBound {
+                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                };
+            }
+        }
+    }
+
+    if let Some(cursor) = &before {
+        if matches!(ordering, Ordering::Descending) {
+            scan.entry_checkpoint = scan.entry_checkpoint.min(cursor.checkpoint);
+        }
+        if hi_admits_upper_bound(scan.hi, cursor.position) {
+            scan.hi = cursor.bound;
+            if matches!(ordering, Ordering::Ascending) || bounds_empty(scan.lo, scan.hi) {
+                cursor_terminal = Some((
+                    cursor.checkpoint,
+                    cursor.position,
+                    sui_rpc_cursor::CursorKind::Boundary,
+                ));
+            }
+            if matches!(ordering, Ordering::Ascending) {
+                scan.end_checkpoint = cursor.checkpoint;
+                scan.end_position = cursor.position;
+                scan.exhaustion = RangeExhaustion::CursorBound {
+                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                };
+            }
+        }
+    }
+
+    if bounds_empty(scan.lo, scan.hi) {
+        scan.empty = true;
+        if let Some((checkpoint, position, kind)) = cursor_terminal {
+            scan.end_checkpoint = checkpoint;
+            scan.end_position = position;
+            scan.exhaustion = RangeExhaustion::CursorBound { kind };
+        } else if after.is_some() || before.is_some() {
+            scan.exhaustion = RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            };
+        }
+    }
+    scan
+}
+
+/// Whether an explicit lo/hi bound pair admits no position.
+fn bounds_empty<P: Copy + Ord>(lo: Bound<P>, hi: Bound<P>) -> bool {
+    match (lo, hi) {
+        (Bound::Included(a), Bound::Excluded(b))
+        | (Bound::Excluded(a), Bound::Excluded(b))
+        | (Bound::Excluded(a), Bound::Included(b)) => a >= b,
+        (Bound::Included(a), Bound::Included(b)) => a > b,
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+    }
+}
+
+/// Collapse symbolic scalar bounds into the store's half-open range — the
+/// only place resume arithmetic survives. Noncollapsed scalar windows always
+/// arrive with an `Included` lower bound (the lane resolves Item exclusions
+/// eagerly; an unresolvable `Excluded(u64::MAX)` collapses the window before
+/// reaching here), but the conversion stays total for safety.
+fn scalar_range(lo: Bound<u64>, hi: Bound<u64>) -> Range<u64> {
+    let end = match hi {
+        Bound::Excluded(hi) => hi,
+        Bound::Included(hi) => hi.saturating_add(1),
+        Bound::Unbounded => u64::MAX,
+    };
+    let start = match lo {
+        Bound::Included(lo) => lo,
+        Bound::Excluded(lo) => match lo.checked_add(1) {
+            Some(successor) => successor,
+            None => return end..end,
+        },
+        Bound::Unbounded => 0,
+    };
+    start..end
+}
+
 fn u64_cursor_position(cursor: &CursorToken) -> u64 {
     match cursor.position {
         Position::Checkpoints { checkpoint } => checkpoint,
@@ -833,7 +892,7 @@ fn event_cursor_position(cursor: &CursorToken) -> EventPosition {
     }
 }
 
-fn lower_bound_gte(candidate: Bound<EventPosition>, current: Bound<EventPosition>) -> bool {
+fn lower_bound_gte<P: Copy + Ord>(candidate: Bound<P>, current: Bound<P>) -> bool {
     let Some(candidate) = lower_bound_key(candidate) else {
         return false;
     };
@@ -843,7 +902,7 @@ fn lower_bound_gte(candidate: Bound<EventPosition>, current: Bound<EventPosition
     }
 }
 
-fn lower_bound_key(bound: Bound<EventPosition>) -> Option<(EventPosition, u8)> {
+fn lower_bound_key<P: Copy + Ord>(bound: Bound<P>) -> Option<(P, u8)> {
     match bound {
         Bound::Included(position) => Some((position, 0)),
         Bound::Excluded(position) => Some((position, 1)),
@@ -851,7 +910,7 @@ fn lower_bound_key(bound: Bound<EventPosition>) -> Option<(EventPosition, u8)> {
     }
 }
 
-fn hi_admits_upper_bound(current: Bound<EventPosition>, candidate: EventPosition) -> bool {
+fn hi_admits_upper_bound<P: Copy + Ord>(current: Bound<P>, candidate: P) -> bool {
     match current {
         Bound::Included(position) | Bound::Excluded(position) => candidate <= position,
         Bound::Unbounded => true,
@@ -1232,6 +1291,11 @@ mod tests {
             12..20
         );
 
+        // An Item at `u64::MAX` has no successor: its exclusion stays
+        // symbolic and collapses the window. The terminal stamp echoes the
+        // cursor back unchanged — Item kind, raw coordinate — like every
+        // other cursor-collapsed window; the stamp sets `CursorBound` and is
+        // never emitted as a terminal frame.
         let options = QueryOptions {
             after: Some(tx_item(1, u64::MAX)),
             ..options
@@ -1242,7 +1306,7 @@ mod tests {
                 1,
                 u64::MAX,
                 RangeExhaustion::CursorBound {
-                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                    kind: sui_rpc_cursor::CursorKind::Item,
                 },
             )
         );
@@ -1261,7 +1325,10 @@ mod tests {
                 kind: sui_rpc_cursor::CursorKind::Boundary,
             }
         );
-        assert_eq!(bounded.end_position, 12);
+        // The terminal stamp stores the winning cursor's RAW coordinate (the
+        // Item at 11), not its resume successor; the stamp sets CursorBound
+        // and is never emitted as a terminal frame.
+        assert_eq!(bounded.end_position, 11);
 
         let options = QueryOptions {
             before: Some(tx_item(1, 12)),

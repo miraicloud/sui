@@ -143,18 +143,6 @@ impl CursorKind {
         Bound::Excluded(position)
     }
 
-    /// The position after an `Item`, or a `Boundary`'s position itself: the
-    /// first position the cursor does not consume, i.e.
-    /// [`Self::resume_bound`] collapsed to u64 arithmetic. `None` when an
-    /// `Item` at the numeric max has no successor.
-    pub fn fencepost(self, coordinate: u64) -> Option<u64> {
-        match self.resume_bound(coordinate) {
-            Bound::Excluded(position) => position.checked_add(1),
-            Bound::Included(position) => Some(position),
-            Bound::Unbounded => None,
-        }
-    }
-
     fn to_proto(self) -> grpc::CursorKind {
         match self {
             CursorKind::Item => grpc::CursorKind::Item,
