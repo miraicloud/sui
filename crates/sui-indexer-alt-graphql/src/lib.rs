@@ -419,6 +419,7 @@ pub async fn start_rpc(
                 readiness.clone(),
                 ledger_grpc.clone(),
                 watermark_task.watermarks_rx(),
+                metrics.subscription.clone(),
             );
             let eviction_task = task::streaming::PackageEvictionTask::new(
                 streaming_packages.clone(),
