@@ -711,43 +711,62 @@ impl CheckpointRange {
         })
     }
 
+    /// Clamped scan-window start, paired with the terminal reason to report if the scan drains into
+    /// this edge (descending). The `after` cursor's checkpoint is treated as an inclusive start as
+    /// the underlying item's cursor may be sub-checkpoint information (e.g transactions or events
+    /// of a checkpoint.) Finer-granularity exclusivity should be handled downstream.
+    fn clamp_start_cp(&self, options: &QueryOptions) -> (u64, RangeExhaustion) {
+        match &options.after {
+            Some(cursor) if cursor.position.checkpoint() >= self.start => (
+                cursor.position.checkpoint(),
+                RangeExhaustion::CursorBound {
+                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                },
+            ),
+            _ => (self.start, RangeExhaustion::CheckpointBound),
+        }
+    }
+
+    /// Clamped scan-window end, paired with the terminal reason to report if the scan drains into
+    /// this edge (ascending); when the cursor doesn't win, the reason is the request-derived one
+    /// from construction (explicit end vs. tip clamp). The `before` cursor always enters as an
+    /// exclusive end (the window is half-open): an Item's checkpoint may still hold admissible
+    /// items before it, so it stays in range (`cp + 1`); a Boundary's checkpoint is already an
+    /// exclusive upper (descending frontiers are emitted pre-bumped).
+    fn clamp_end_cp(&self, options: &QueryOptions) -> (u64, RangeExhaustion) {
+        let upper = options
+            .before
+            .as_ref()
+            .and_then(|cursor| match cursor.kind {
+                sui_rpc_cursor::CursorKind::Item => cursor.position.checkpoint().checked_add(1),
+                sui_rpc_cursor::CursorKind::Boundary => Some(cursor.position.checkpoint()),
+            });
+        match upper {
+            Some(upper) if upper <= self.end => (
+                upper,
+                RangeExhaustion::CursorBound {
+                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                },
+            ),
+            _ => (self.end, self.high_exhaustion),
+        }
+    }
+
     /// Tighten the interval by the request's cursors and attribute the exhaustion reason the scan
     /// will report once it drains it. Also designates the terminal edge and consequently which
     /// exhaustion reason the client sees.
     pub fn resolve(self, options: &QueryOptions) -> ResolvedCheckpointRange {
-        let mut start = self.start;
-        let mut end = self.end;
-        let mut low_exhaustion = RangeExhaustion::CheckpointBound;
-        let mut high_exhaustion = self.high_exhaustion;
-        let mut cursor_bound = false;
-
-        // Clamp each edge by its cursor and re-attribute that edge's exhaustion to the cursor when
-        // it wins.
-        if let Some(cursor) = &options.after
-            && cursor.position.checkpoint() >= start
-        {
-            start = cursor.position.checkpoint();
-            low_exhaustion = RangeExhaustion::CursorBound {
-                kind: sui_rpc_cursor::CursorKind::Boundary,
-            };
-            cursor_bound = true;
-        }
-
-        if let Some(cursor) = &options.before
-            && let Some(upper) = cursor.kind.fencepost(cursor.position.checkpoint())
-            && upper <= end
-        {
-            end = upper;
-            high_exhaustion = RangeExhaustion::CursorBound {
-                kind: sui_rpc_cursor::CursorKind::Boundary,
-            };
-            cursor_bound = true;
-        }
+        let (start, low_exhaustion) = self.clamp_start_cp(options);
+        let (end, high_exhaustion) = self.clamp_end_cp(options);
 
         if start >= self.indexed_tip {
             return ResolvedCheckpointRange::empty_at(self.indexed_tip, RangeExhaustion::LedgerTip);
         }
         if start >= end {
+            // A cursor-collapsed interval reports CursorBound no matter which
+            // edge is terminal: the paging itself consumed the range.
+            let cursor_bound = matches!(low_exhaustion, RangeExhaustion::CursorBound { .. })
+                || matches!(high_exhaustion, RangeExhaustion::CursorBound { .. });
             let exhaustion = if cursor_bound {
                 RangeExhaustion::CursorBound {
                     kind: sui_rpc_cursor::CursorKind::Boundary,
@@ -868,6 +887,8 @@ fn invalid_cursor(field: &'static str, description: impl Into<String>) -> RpcErr
 
 #[cfg(test)]
 mod tests {
+    use sui_rpc_cursor::CursorKind;
+
     use super::*;
 
     fn query_options_from_proto(
@@ -1319,6 +1340,222 @@ mod tests {
         let resolved = range.resolve(&options);
         assert_eq!(resolved.range, 10..10_000_000);
         assert_eq!(resolved.exhaustion, RangeExhaustion::CheckpointBound);
+    }
+
+    fn cp_boundary(checkpoint: u64) -> CursorToken {
+        CursorToken::boundary(Position::Checkpoints { checkpoint })
+    }
+
+    /// Cursor clamps at checkpoint granularity: `after` keeps its checkpoint
+    /// as the inclusive start, `before` keeps an Item's checkpoint in range
+    /// (`cp + 1`) but takes a Boundary's as-is, the exhaustion reason follows
+    /// the ordering-side terminal edge, and a cursor-collapsed interval
+    /// reports CursorBound.
+    #[test]
+    fn resolves_checkpoint_range_with_cursor_clamps() {
+        let range = || CheckpointRange::from_request(Some(10), Some(20), 100).unwrap();
+
+        let after_item = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: Some(cp_item(12)),
+            before: None,
+        };
+        let resolved = range().resolve(&after_item);
+        assert_eq!(resolved.range, 12..20);
+        assert_eq!(resolved.exhaustion, RangeExhaustion::CheckpointBound);
+
+        let resolved = range().resolve(&QueryOptions {
+            ordering: Ordering::Descending,
+            ..after_item.clone()
+        });
+        assert_eq!(resolved.range, 12..20);
+        assert_eq!(
+            resolved.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            }
+        );
+
+        let before_item = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: None,
+            before: Some(cp_item(15)),
+        };
+        let resolved = range().resolve(&before_item);
+        assert_eq!(resolved.range, 10..16);
+        assert_eq!(
+            resolved.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            }
+        );
+
+        let resolved = range().resolve(&QueryOptions {
+            before: Some(cp_boundary(15)),
+            ..before_item.clone()
+        });
+        assert_eq!(resolved.range, 10..15);
+
+        let collapsed = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: Some(cp_item(18)),
+            before: Some(cp_boundary(18)),
+        };
+        assert_eq!(
+            range().resolve(&collapsed),
+            ResolvedCheckpointRange::empty_at(
+                18,
+                RangeExhaustion::CursorBound {
+                    kind: sui_rpc_cursor::CursorKind::Boundary,
+                }
+            )
+        );
+    }
+
+    fn event_cursor(
+        kind: CursorKind,
+        checkpoint: u64,
+        tx_seq: u64,
+        event_index: u32,
+    ) -> CursorToken {
+        CursorToken {
+            kind,
+            position: Position::Events {
+                checkpoint,
+                tx_seq,
+                event_index,
+            },
+        }
+    }
+
+    /// When both cursors collapse the interval, the reported terminal is the
+    /// `before` record (always Boundary), not the `after` echo — even when
+    /// the `after` Item alone would have emptied the interval and echoed
+    /// Item kind.
+    #[test]
+    fn event_collapse_prefers_before_record_over_after_echo() {
+        let resolved = ResolvedEventRange {
+            bounds: EventScanBounds::tx_span(0, 10),
+            end_checkpoint: 5,
+            end_position: EventPosition::start_of_tx(10),
+            exhaustion: RangeExhaustion::CheckpointBound,
+            entry_checkpoint: 0,
+        };
+
+        let options = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: Some(event_cursor(CursorKind::Item, 2, 10, 0)),
+            before: Some(event_cursor(CursorKind::Item, 1, 3, 0)),
+        };
+        let bounded = options.apply_event_cursor_bounds(resolved.clone());
+        assert!(bounded.is_empty());
+        assert_eq!(bounded.end_checkpoint, 1);
+        assert_eq!(
+            bounded.end_position,
+            EventPosition {
+                tx_seq: 3,
+                event_index: 0,
+            }
+        );
+        assert_eq!(
+            bounded.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            }
+        );
+
+        // Without the before cursor, the same after Item echoes back as-is.
+        let options = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: Some(event_cursor(CursorKind::Item, 2, 10, 0)),
+            before: None,
+        };
+        let bounded = options.apply_event_cursor_bounds(resolved);
+        assert!(bounded.is_empty());
+        assert_eq!(bounded.end_checkpoint, 2);
+        assert_eq!(
+            bounded.end_position,
+            EventPosition {
+                tx_seq: 10,
+                event_index: 0,
+            }
+        );
+        assert_eq!(
+            bounded.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Item,
+            }
+        );
+    }
+
+    /// Nonempty intervals terminate at the ordering-side cursor edge: a
+    /// winning `after` sets the terminal metadata for descending scans, a
+    /// winning `before` for ascending scans, and the opposite-edge cursor
+    /// only advances the entry checkpoint.
+    #[test]
+    fn event_terminal_edge_winner_sets_end_metadata() {
+        let resolved = ResolvedEventRange {
+            bounds: EventScanBounds::tx_span(0, 10),
+            end_checkpoint: 99,
+            end_position: EventPosition::start_of_tx(0),
+            exhaustion: RangeExhaustion::CheckpointBound,
+            entry_checkpoint: 50,
+        };
+
+        let descending = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Descending,
+            after: Some(event_cursor(CursorKind::Item, 2, 4, 1)),
+            before: Some(event_cursor(CursorKind::Item, 8, 9, 0)),
+        };
+        let bounded = descending.apply_event_cursor_bounds(resolved.clone());
+        assert!(!bounded.is_empty());
+        assert_eq!(bounded.end_checkpoint, 2);
+        assert_eq!(
+            bounded.end_position,
+            EventPosition {
+                tx_seq: 4,
+                event_index: 1,
+            }
+        );
+        assert_eq!(
+            bounded.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            }
+        );
+        // Descending entry edge is the before cursor, win or lose.
+        assert_eq!(bounded.entry_checkpoint, 8);
+
+        let ascending = QueryOptions {
+            limit_items: 100,
+            ordering: Ordering::Ascending,
+            after: Some(event_cursor(CursorKind::Item, 2, 4, 1)),
+            before: Some(event_cursor(CursorKind::Item, 8, 9, 0)),
+        };
+        let bounded = ascending.apply_event_cursor_bounds(resolved);
+        assert!(!bounded.is_empty());
+        assert_eq!(bounded.end_checkpoint, 8);
+        assert_eq!(
+            bounded.end_position,
+            EventPosition {
+                tx_seq: 9,
+                event_index: 0,
+            }
+        );
+        assert_eq!(
+            bounded.exhaustion,
+            RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            }
+        );
+        // Ascending entry edge is the after cursor, win or lose.
+        assert_eq!(bounded.entry_checkpoint, 50);
     }
 
     #[test]
