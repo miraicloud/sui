@@ -396,17 +396,10 @@ impl QueryOptions {
             if matches!(self.ordering, Ordering::Ascending) {
                 entry_checkpoint = entry_checkpoint.max(cursor.position.checkpoint());
             }
-            let candidate = match cursor.kind {
-                sui_rpc_cursor::CursorKind::Item => Bound::Excluded(position),
-                sui_rpc_cursor::CursorKind::Boundary => Bound::Included(position),
-            };
+            let candidate = cursor.kind.resume_bound(position);
             if lower_bound_gte(candidate, bounds.lo) {
-                let candidate_bounds = EventScanBounds {
-                    lo: candidate,
-                    hi: bounds.hi,
-                };
                 bounds.lo = candidate;
-                if matches!(self.ordering, Ordering::Descending) || candidate_bounds.is_empty() {
+                if matches!(self.ordering, Ordering::Descending) || bounds.is_empty() {
                     let kind = if matches!(self.ordering, Ordering::Ascending) {
                         cursor.kind
                     } else {
@@ -430,13 +423,8 @@ impl QueryOptions {
                 entry_checkpoint = entry_checkpoint.min(cursor.position.checkpoint());
             }
             if hi_admits_upper_bound(bounds.hi, position) {
-                let candidate = Bound::Excluded(position);
-                let candidate_bounds = EventScanBounds {
-                    lo: bounds.lo,
-                    hi: candidate,
-                };
-                bounds.hi = candidate;
-                if matches!(self.ordering, Ordering::Ascending) || candidate_bounds.is_empty() {
+                bounds.hi = cursor.kind.limit_bound(position);
+                if matches!(self.ordering, Ordering::Ascending) || bounds.is_empty() {
                     cursor_terminal = Some((
                         cursor.position.checkpoint(),
                         position,

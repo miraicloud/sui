@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ops::Bound;
+
 use anyhow::Context as _;
 use bytes::Bytes;
 use prost::Message as _;
@@ -125,15 +127,32 @@ impl CursorToken {
 }
 
 impl CursorKind {
-    /// The fencepost a cursor coordinate maps to in half-open range space: an
+    /// Lower (resume) bound a cursor imposes on a scan: an `Item` was
+    /// delivered, so the scan resumes strictly after it; a `Boundary` is a
+    /// frontier, so the scan resumes at it.
+    pub fn resume_bound<P>(self, position: P) -> Bound<P> {
+        match self {
+            CursorKind::Item => Bound::Excluded(position),
+            CursorKind::Boundary => Bound::Included(position),
+        }
+    }
+
+    /// Upper bound a `before` cursor imposes on a scan: exclusive at the
+    /// coordinate for both kinds.
+    pub fn limit_bound<P>(self, position: P) -> Bound<P> {
+        Bound::Excluded(position)
+    }
+
+    /// [`Self::resume_bound`] collapsed to u64 fencepost arithmetic: an
     /// `Item` names a consumed row, so its fencepost sits one past it; a
     /// `Boundary` already names a fencepost. Serves as an inclusive lower
     /// bound and an exclusive upper bound alike. `None` when an `Item` at the
     /// numeric max has no successor.
     pub fn fencepost(self, coordinate: u64) -> Option<u64> {
-        match self {
-            CursorKind::Item => coordinate.checked_add(1),
-            CursorKind::Boundary => Some(coordinate),
+        match self.resume_bound(coordinate) {
+            Bound::Excluded(position) => position.checked_add(1),
+            Bound::Included(position) => Some(position),
+            Bound::Unbounded => None,
         }
     }
 
