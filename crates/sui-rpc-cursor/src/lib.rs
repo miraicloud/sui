@@ -125,6 +125,18 @@ impl CursorToken {
 }
 
 impl CursorKind {
+    /// The fencepost a cursor coordinate maps to in half-open range space: an
+    /// `Item` names a consumed row, so its fencepost sits one past it; a
+    /// `Boundary` already names a fencepost. Serves as an inclusive lower
+    /// bound and an exclusive upper bound alike. `None` when an `Item` at the
+    /// numeric max has no successor.
+    pub fn fencepost(self, coordinate: u64) -> Option<u64> {
+        match self {
+            CursorKind::Item => coordinate.checked_add(1),
+            CursorKind::Boundary => Some(coordinate),
+        }
+    }
+
     fn to_proto(self) -> grpc::CursorKind {
         match self {
             CursorKind::Item => grpc::CursorKind::Item,

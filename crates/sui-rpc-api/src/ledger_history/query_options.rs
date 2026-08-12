@@ -143,6 +143,10 @@ pub struct ResolvedEventRange {
     pub exhaustion: RangeExhaustion,
 }
 
+/// A request's checkpoint bounds, validated and clamped to the indexed tip. `start..end` is an
+/// Ordering-agnostic ascending-normalized half-open interval. `high_exhaustion` records why the
+/// high edge stops where it does (explicit `end_checkpoint` vs. the tip clamp). The low edge is
+/// always the caller's `start_checkpoint`, so its reason needs no field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointRange {
     start: u64,
@@ -295,10 +299,7 @@ impl QueryOptions {
             if matches!(self.ordering, Ordering::Ascending) {
                 entry_checkpoint = entry_checkpoint.max(cursor.position.checkpoint());
             }
-            let Some(after) = (match cursor.kind {
-                sui_rpc_cursor::CursorKind::Item => position.checked_add(1),
-                sui_rpc_cursor::CursorKind::Boundary => Some(position),
-            }) else {
+            let Some(after) = cursor.kind.fencepost(position) else {
                 // `u64::MAX` is the unoccupiable exclusive sentinel of these
                 // packed ranges (a real item at MAX could not be represented by
                 // the required exclusive end). A Boundary cursor at MAX is
@@ -722,6 +723,9 @@ impl CheckpointRange {
         })
     }
 
+    /// Tighten the interval by the request's cursors and attribute the exhaustion reason the scan
+    /// will report once it drains it. Also designates the terminal edge and consequently which
+    /// exhaustion reason the client sees.
     pub fn resolve(self, options: &QueryOptions) -> ResolvedCheckpointRange {
         let mut start = self.start;
         let mut end = self.end;
@@ -729,38 +733,32 @@ impl CheckpointRange {
         let mut high_exhaustion = self.high_exhaustion;
         let mut cursor_bound = false;
 
+        // Clamp each edge by its cursor and re-attribute that edge's exhaustion to the cursor when
+        // it wins.
         if let Some(cursor) = &options.after
             && cursor.position.checkpoint() >= start
         {
             start = cursor.position.checkpoint();
+            low_exhaustion = RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            };
             cursor_bound = true;
-            if matches!(options.ordering, Ordering::Descending) {
-                low_exhaustion = RangeExhaustion::CursorBound {
-                    kind: sui_rpc_cursor::CursorKind::Boundary,
-                };
-            }
         }
 
         if let Some(cursor) = &options.before
-            && let Some(upper) = match cursor.kind {
-                sui_rpc_cursor::CursorKind::Item => cursor.position.checkpoint().checked_add(1),
-                sui_rpc_cursor::CursorKind::Boundary => Some(cursor.position.checkpoint()),
-            }
+            && let Some(upper) = cursor.kind.fencepost(cursor.position.checkpoint())
             && upper <= end
         {
             end = upper;
+            high_exhaustion = RangeExhaustion::CursorBound {
+                kind: sui_rpc_cursor::CursorKind::Boundary,
+            };
             cursor_bound = true;
-            if matches!(options.ordering, Ordering::Ascending) {
-                high_exhaustion = RangeExhaustion::CursorBound {
-                    kind: sui_rpc_cursor::CursorKind::Boundary,
-                };
-            }
         }
 
         if start >= self.indexed_tip {
             return ResolvedCheckpointRange::empty_at(self.indexed_tip, RangeExhaustion::LedgerTip);
         }
-
         if start >= end {
             let exhaustion = if cursor_bound {
                 RangeExhaustion::CursorBound {
@@ -779,6 +777,7 @@ impl CheckpointRange {
             return ResolvedCheckpointRange::empty_at(checkpoint, exhaustion);
         }
 
+        // Terminal-edge selection.
         let exhaustion = match options.ordering {
             Ordering::Ascending => high_exhaustion,
             Ordering::Descending => low_exhaustion,
