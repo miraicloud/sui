@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 133;
+const MAX_PROTOCOL_VERSION: u64 = 134;
 
 const TESTNET_USDC: &str =
     "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC";
@@ -374,6 +374,8 @@ const MAINNET_USDB: &str =
 //              Create the ForwardingAddressRegistry system object on devnet.
 //              Make upgrade-init linkage checks independent of PTB command order.
 // Version 133: Add `package::original_package_id` and its native costs.
+// Version 134: Enable the step-by-step gas-charging pipeline (gas_model_version 15),
+//              replacing the monolithic charge_gas with discrete charging steps.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -4568,6 +4570,9 @@ impl ProtocolConfig {
                     let package_read_cost_per_byte = cfg.obj_access_cost_read_per_byte();
                     cfg.package_original_package_id_impl_cost_per_byte =
                         Some(package_read_cost_per_byte);
+                }
+                134 => {
+                    cfg.gas_model_version = Some(15);
                 }
                 // Use this template when making changes:
                 //
