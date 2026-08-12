@@ -21,10 +21,8 @@ use super::ProcessedCheckpoint;
 use super::checkpoint_stream_task::checkpoint_field_mask;
 use super::checkpoint_stream_task::process_checkpoint;
 use crate::task::watermark::KV_PACKAGES_PIPELINE;
+use crate::task::watermark::LEDGER_GRPC_PIPELINE;
 use crate::task::watermark::Watermarks;
-
-/// Pipeline name under which `WatermarkTask` tracks the kv-rpc / LedgerService source.
-const LEDGER_GRPC_PIPELINE: &str = "ledger_grpc";
 
 /// Abstraction over the source that gap recovery fetches checkpoints from. The production
 /// implementation talks to kv-rpc via `LedgerGrpcReader`; tests use an in-memory mock.
