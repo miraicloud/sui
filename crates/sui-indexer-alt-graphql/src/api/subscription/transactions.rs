@@ -71,7 +71,7 @@ use crate::task::streaming::StreamingPackageStore;
 use crate::task::streaming::SubscriptionBroadcast;
 use crate::task::streaming::broadcast_error;
 use crate::task::streaming::reconnect_error;
-use crate::task::streaming::wait_for_pipelines_catching_up_at;
+use crate::task::streaming::wait_for_ledger_grpc_catching_up_at;
 use crate::task::watermark::Watermarks;
 
 /// How long to wait before re-requesting when the scan has drained the indexer's current tip but not
@@ -358,8 +358,9 @@ async fn scan_page(
         };
         let end_cursor = CursorToken::decode(end_cursor).context("Failed to decode scan cursor")?;
 
-        // Hold the page until both pipelines have indexed through its end.
-        wait_for_pipelines_catching_up_at(end_cursor.position.checkpoint(), watermarks_rx).await?;
+        // Hold the page until the ledger gRPC service has indexed through its end.
+        wait_for_ledger_grpc_catching_up_at(end_cursor.position.checkpoint(), watermarks_rx)
+            .await?;
 
         // Each match's checkpoint, read from the raw item cursors before the page is converted.
         let mut checkpoints = Vec::with_capacity(result.items.len());
