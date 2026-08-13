@@ -156,6 +156,31 @@ pub enum SuiValidatorCommand {
         #[clap(flatten)]
         tx_args: TxProcessingArgs,
     },
+    /// Export public backup metadata and create a PoP without accessing the validator account key.
+    #[clap(name = "make-validator-promotion-target")]
+    MakeValidatorPromotionTarget {
+        #[clap(name = "plan-id", long)]
+        plan_id: String,
+        #[clap(name = "validator-address", long)]
+        validator_address: SuiAddress,
+        #[clap(name = "protocol-key-path", long)]
+        protocol_key_path: PathBuf,
+        #[clap(name = "network-key-path", long)]
+        network_key_path: PathBuf,
+        #[clap(name = "worker-key-path", long)]
+        worker_key_path: PathBuf,
+        #[clap(name = "network-address", long)]
+        network_address: Multiaddr,
+        #[clap(name = "p2p-address", long)]
+        p2p_address: Multiaddr,
+        #[clap(name = "primary-address", long)]
+        primary_address: Multiaddr,
+        #[clap(name = "worker-address", long)]
+        worker_address: Multiaddr,
+        /// New JSON file containing only public material. Must not already exist.
+        #[clap(name = "target-path", long)]
+        target_path: PathBuf,
+    },
     /// Build, but never sign, the atomic next-epoch transaction for a validator promotion.
     #[clap(name = "prepare-validator-promotion")]
     PrepareValidatorPromotion {
@@ -295,6 +320,10 @@ pub enum SuiValidatorCommandResponse {
     UpdateMetadata {
         response: Option<ExecutedTransaction>,
         serialized_unsigned_transaction: Option<String>,
+    },
+    MakeValidatorPromotionTarget {
+        target_path: PathBuf,
+        protocol_public_key: String,
     },
     PrepareValidatorPromotion {
         transaction_digest: TransactionDigest,
@@ -556,6 +585,46 @@ impl SuiValidatorCommand {
                 SuiValidatorCommandResponse::UpdateMetadata {
                     response,
                     serialized_unsigned_transaction,
+                }
+            }
+
+            SuiValidatorCommand::MakeValidatorPromotionTarget {
+                plan_id,
+                validator_address,
+                protocol_key_path,
+                network_key_path,
+                worker_key_path,
+                network_address,
+                p2p_address,
+                primary_address,
+                worker_address,
+                target_path,
+            } => {
+                let protocol = read_authority_keypair_from_file(protocol_key_path)?;
+                let network = read_network_keypair_from_file(network_key_path)?;
+                let worker = read_network_keypair_from_file(worker_key_path)?;
+                let request = ValidatorPromotionTargetRequest {
+                    plan_id,
+                    validator_address,
+                    target: ValidatorPromotionTarget {
+                        protocol_public_key: Hex::encode(protocol.public().as_bytes()),
+                        network_public_key: Hex::encode(network.public().as_bytes()),
+                        worker_public_key: Hex::encode(worker.public().as_bytes()),
+                        network_address,
+                        p2p_address,
+                        primary_address,
+                        worker_address,
+                    },
+                    proof_of_possession: Hex::encode(
+                        generate_proof_of_possession(&protocol, validator_address).as_ref(),
+                    ),
+                };
+                validate_promotion_target_request(&request)?;
+                let protocol_public_key = request.target.protocol_public_key.clone();
+                write_new_json(&target_path, &request)?;
+                SuiValidatorCommandResponse::MakeValidatorPromotionTarget {
+                    target_path,
+                    protocol_public_key,
                 }
             }
 
@@ -1595,6 +1664,13 @@ impl Display for SuiValidatorCommandResponse {
                     writer,
                     "Serialized unsigned transaction: {serialized_unsigned_transaction}"
                 )?;
+            }
+            SuiValidatorCommandResponse::MakeValidatorPromotionTarget {
+                target_path,
+                protocol_public_key,
+            } => {
+                writeln!(writer, "Promotion target: {}", target_path.display())?;
+                write!(writer, "Target protocol public key: {protocol_public_key}")?;
             }
             SuiValidatorCommandResponse::FinalizeValidatorPromotion {
                 transaction_digest,

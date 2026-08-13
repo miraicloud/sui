@@ -943,6 +943,12 @@ impl SuiNode {
                             "promotion source validator is absent from the current committee",
                         )?;
                     guard.manifest().validate_source_validator(&validator)?;
+                    info!(
+                        plan_id = %guard.manifest().plan_id,
+                        source_epoch = guard.manifest().source_epoch,
+                        activation_epoch = guard.manifest().activation_epoch,
+                        "Loaded prepared validator promotion plan"
+                    );
                 }
                 ValidatorPromotionPhase::CommitteeObserved => {
                     bail!(
