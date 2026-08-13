@@ -13,7 +13,6 @@ use fastcrypto::{
     encoding::{Encoding, Hex},
     traits::{KeyPair, ToFromBytes},
 };
-use mysten_network::Multiaddr;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::{
@@ -21,15 +20,20 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use sui_config::NodeConfig;
+use sui_config::{
+    NodeConfig,
+    node::{
+        VALIDATOR_PROMOTION_MANIFEST_VERSION, ValidatorPromotionManifest, ValidatorPromotionTarget,
+    },
+};
 use sui_core::{authority::AuthorityState, checkpoints::CheckpointStore};
 use sui_types::{
     SUI_SYSTEM_PACKAGE_ID,
-    base_types::{EpochId, SuiAddress},
+    base_types::EpochId,
     crypto::{
         AuthorityPublicKey, AuthoritySignature, NetworkPublicKey, verify_proof_of_possession,
     },
-    digests::{ChainIdentifier, TransactionDigest},
+    digests::ChainIdentifier,
     effects::TransactionEffectsAPI,
     sui_system_state::epoch_start_sui_system_state::EpochStartValidatorInfoV1,
     transaction::{
@@ -38,47 +42,7 @@ use sui_types::{
     },
 };
 
-const MANIFEST_VERSION: u64 = 1;
 const STATE_VERSION: u64 = 1;
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ValidatorPromotionManifest {
-    pub version: u64,
-    pub plan_id: String,
-    /// Full 32-byte genesis checkpoint digest, encoded as lowercase hex.
-    pub chain_identifier: String,
-    pub source_epoch: EpochId,
-    pub activation_epoch: EpochId,
-    pub validator_address: SuiAddress,
-    /// The authority name that must be replaced. Encoded as lowercase hex.
-    pub source_protocol_public_key: String,
-    pub target: ValidatorPromotionTarget,
-    /// BLS proof of possession by the target protocol key over `validator_address`.
-    pub proof_of_possession: String,
-    pub evidence: ValidatorPromotionEvidence,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ValidatorPromotionTarget {
-    pub protocol_public_key: String,
-    pub network_public_key: String,
-    pub worker_public_key: String,
-    pub network_address: Multiaddr,
-    pub p2p_address: Multiaddr,
-    pub primary_address: Multiaddr,
-    pub worker_address: Multiaddr,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ValidatorPromotionEvidence {
-    /// Digest of the one programmable transaction that stages every target metadata field.
-    pub transaction_digest: TransactionDigest,
-    /// Finalized source-epoch checkpoint containing `transaction_digest`.
-    pub checkpoint_sequence_number: u64,
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -162,24 +126,32 @@ pub struct ValidatorPromotionGuard {
     state_path: PathBuf,
 }
 
-impl ValidatorPromotionManifest {
-    pub fn load(path: &Path) -> Result<Self> {
+pub(crate) trait ValidatorPromotionManifestExt {
+    fn load(path: &Path) -> Result<ValidatorPromotionManifest>;
+    fn digest(&self) -> Result<String>;
+    fn validate_static(&self, chain: ChainIdentifier, config: &NodeConfig) -> Result<()>;
+    fn validate_target_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()>;
+    fn validate_source_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()>;
+}
+
+impl ValidatorPromotionManifestExt for ValidatorPromotionManifest {
+    fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read promotion manifest {}", path.display()))?;
         serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse promotion manifest {}", path.display()))
     }
 
-    pub fn digest(&self) -> Result<String> {
+    fn digest(&self) -> Result<String> {
         use fastcrypto::hash::{Blake2b256, HashFunction};
 
         let bytes = serde_json::to_vec(self)?;
         Ok(Hex::encode(Blake2b256::digest(&bytes)))
     }
 
-    pub fn validate_static(&self, chain: ChainIdentifier, config: &NodeConfig) -> Result<()> {
+    fn validate_static(&self, chain: ChainIdentifier, config: &NodeConfig) -> Result<()> {
         ensure!(
-            self.version == MANIFEST_VERSION,
+            self.version == VALIDATOR_PROMOTION_MANIFEST_VERSION,
             "unsupported promotion manifest version"
         );
         ensure!(
@@ -236,7 +208,7 @@ impl ValidatorPromotionManifest {
         Ok(())
     }
 
-    pub fn validate_target_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()> {
+    fn validate_target_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()> {
         ensure!(
             validator.sui_address == self.validator_address,
             "promotion target validator address mismatch"
@@ -272,7 +244,7 @@ impl ValidatorPromotionManifest {
         Ok(())
     }
 
-    pub fn validate_source_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()> {
+    fn validate_source_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()> {
         ensure!(
             validator.sui_address == self.validator_address,
             "promotion source validator address mismatch"
@@ -285,7 +257,13 @@ impl ValidatorPromotionManifest {
     }
 }
 
-impl ValidatorPromotionTarget {
+trait ValidatorPromotionTargetExt {
+    fn protocol_key(&self) -> Result<AuthorityPublicKey>;
+    fn network_key(&self) -> Result<NetworkPublicKey>;
+    fn worker_key(&self) -> Result<NetworkPublicKey>;
+}
+
+impl ValidatorPromotionTargetExt for ValidatorPromotionTarget {
     fn protocol_key(&self) -> Result<AuthorityPublicKey> {
         parse_authority_key(&self.protocol_public_key).context("invalid target protocol public key")
     }
@@ -650,6 +628,7 @@ mod tests {
     use sui_types::transaction::{
         GasData, ProgrammableMoveCall, ProgrammableTransaction, TransactionDataV1,
     };
+    use sui_types::{base_types::SuiAddress, digests::TransactionDigest};
 
     fn test_manifest() -> (
         ValidatorPromotionManifest,
@@ -675,7 +654,7 @@ mod tests {
             worker_address: "/dns/validator.example/udp/8082".parse().unwrap(),
         };
         let manifest = ValidatorPromotionManifest {
-            version: MANIFEST_VERSION,
+            version: VALIDATOR_PROMOTION_MANIFEST_VERSION,
             plan_id: "test-plan-1".to_string(),
             chain_identifier: Hex::encode(chain.as_bytes()),
             source_epoch: 41,
@@ -684,7 +663,7 @@ mod tests {
             source_protocol_public_key: Hex::encode(source_protocol.public().as_bytes()),
             target: target.clone(),
             proof_of_possession: Hex::encode(pop.as_ref()),
-            evidence: ValidatorPromotionEvidence {
+            evidence: sui_config::node::ValidatorPromotionEvidence {
                 transaction_digest: TransactionDigest::random(),
                 checkpoint_sequence_number: 100,
             },

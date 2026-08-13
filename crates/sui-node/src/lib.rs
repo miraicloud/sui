@@ -167,7 +167,7 @@ mod handle;
 pub mod metrics;
 pub mod promotion;
 
-use promotion::{ValidatorPromotionGuard, ValidatorPromotionPhase};
+use promotion::{ValidatorPromotionGuard, ValidatorPromotionManifestExt, ValidatorPromotionPhase};
 
 pub struct ValidatorComponents {
     validator_server_handle: Option<SpawnOnce>,

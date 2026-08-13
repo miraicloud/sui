@@ -21,7 +21,7 @@ use sui_core::authority_aggregator::AuthorityAggregator;
 use sui_core::authority_client::NetworkAuthorityClient;
 use sui_core::transaction_driver::SubmitTransactionOptions;
 use sui_keys::keystore::{AccountKeystore, FileBasedKeystore, Keystore};
-use sui_node::SuiNodeHandle;
+use sui_node::{SuiNodeHandle, SuiNodeShutdownReason};
 use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_rpc_api::Client;
 use sui_rpc_api::client::ExecutedTransaction;
@@ -311,8 +311,8 @@ impl TestCluster {
                 msg = shutdown_channel_rx.recv() =>
                 {
                     match msg {
-                        Ok(Some(run_with_range)) => Some(run_with_range),
-                        Ok(None) => None,
+                        Ok(SuiNodeShutdownReason::RunWithRange(run_with_range)) => run_with_range,
+                        Ok(SuiNodeShutdownReason::RoleTransition { .. }) => None,
                         Err(e) => {
                             error!("failed recv from sui-node shutdown channel: {}", e);
                             None

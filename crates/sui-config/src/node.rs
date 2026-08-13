@@ -29,6 +29,7 @@ use sui_types::crypto::AuthorityPublicKeyBytes;
 use sui_types::crypto::KeypairTraits;
 use sui_types::crypto::NetworkKeyPair;
 use sui_types::crypto::SuiKeyPair;
+use sui_types::digests::TransactionDigest;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::node_role::{FullNodeSyncMode, NodeRole};
 use sui_types::supported_protocol_versions::{Chain, SupportedProtocolVersions};
@@ -320,6 +321,47 @@ pub struct ValidatorRoleTransitionConfig {
     /// service identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion_state_path: Option<PathBuf>,
+}
+
+pub const VALIDATOR_PROMOTION_MANIFEST_VERSION: u64 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ValidatorPromotionManifest {
+    pub version: u64,
+    pub plan_id: String,
+    /// Full 32-byte genesis checkpoint digest, encoded as lowercase hex.
+    pub chain_identifier: String,
+    pub source_epoch: EpochId,
+    pub activation_epoch: EpochId,
+    pub validator_address: SuiAddress,
+    /// The authority name that must be replaced. Encoded as lowercase hex.
+    pub source_protocol_public_key: String,
+    pub target: ValidatorPromotionTarget,
+    /// BLS proof of possession by the target protocol key over `validator_address`.
+    pub proof_of_possession: String,
+    pub evidence: ValidatorPromotionEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ValidatorPromotionTarget {
+    pub protocol_public_key: String,
+    pub network_public_key: String,
+    pub worker_public_key: String,
+    pub network_address: Multiaddr,
+    pub p2p_address: Multiaddr,
+    pub primary_address: Multiaddr,
+    pub worker_address: Multiaddr,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ValidatorPromotionEvidence {
+    /// Digest of the one programmable transaction that stages every target metadata field.
+    pub transaction_digest: TransactionDigest,
+    /// Finalized source-epoch checkpoint containing `transaction_digest`.
+    pub checkpoint_sequence_number: CheckpointSequenceNumber,
 }
 
 impl ValidatorRoleTransitionConfig {

@@ -1,14 +1,20 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Result, anyhow, bail};
-use move_core_types::ident_str;
+use anyhow::{Context, Result, anyhow, bail};
+use move_core_types::{ident_str, identifier::Identifier};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt::{self, Debug, Display, Formatter, Write},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write as _,
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
+};
+use sui_config::node::{
+    VALIDATOR_PROMOTION_MANIFEST_VERSION, ValidatorPromotionEvidence, ValidatorPromotionManifest,
+    ValidatorPromotionTarget,
 };
 use sui_genesis_builder::validator_info::GenesisValidatorInfo;
 use url::{ParseError, Url};
@@ -19,7 +25,11 @@ use sui_rpc_api::client::ExecutedTransaction;
 use sui_types::{
     SUI_SYSTEM_PACKAGE_ID,
     base_types::{ObjectID, ObjectRef, SuiAddress},
-    crypto::{AuthorityPublicKey, DEFAULT_EPOCH_ID, NetworkPublicKey, Signable},
+    crypto::{
+        AuthorityPublicKey, AuthoritySignature, DEFAULT_EPOCH_ID, NetworkPublicKey, Signable,
+        verify_proof_of_possession,
+    },
+    digests::{ChainIdentifier, TransactionDigest},
     effects::TransactionEffectsAPI,
     multiaddr::Multiaddr,
     object::Owner,
@@ -32,7 +42,7 @@ use clap::*;
 use colored::Colorize;
 use fastcrypto::traits::ToFromBytes;
 use fastcrypto::{
-    encoding::{Base64, Encoding},
+    encoding::{Base64, Encoding, Hex},
     traits::KeyPair,
 };
 use serde::Serialize;
@@ -55,7 +65,11 @@ use sui_types::crypto::{AuthorityKeyPair, NetworkKeyPair, SignatureScheme, SuiKe
 use sui_types::crypto::{
     AuthorityPublicKeyBytes, generate_proof_of_possession, get_authority_key_pair,
 };
-use sui_types::transaction::{CallArg, ObjectArg, Transaction, TransactionData};
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::{
+    Argument, CallArg, Command, GasData, ObjectArg, Transaction, TransactionData,
+    TransactionDataAPI, TransactionExpiration, TransactionKind,
+};
 
 #[path = "unit_tests/validator_tests.rs"]
 #[cfg(test)]
@@ -74,6 +88,29 @@ pub struct TxProcessingArgs {
     /// Gas budget for this transaction
     #[clap(name = "gas-budget", long)]
     pub gas_budget: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ValidatorPromotionTargetRequest {
+    pub plan_id: String,
+    pub validator_address: SuiAddress,
+    pub target: ValidatorPromotionTarget,
+    pub proof_of_possession: String,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ValidatorPromotionDraft {
+    pub version: u64,
+    pub plan_id: String,
+    pub chain_identifier: String,
+    pub source_epoch: u64,
+    pub activation_epoch: u64,
+    pub validator_address: SuiAddress,
+    pub source_protocol_public_key: String,
+    pub target: ValidatorPromotionTarget,
+    pub proof_of_possession: String,
 }
 
 #[derive(Parser)]
@@ -118,6 +155,30 @@ pub enum SuiValidatorCommand {
         metadata: MetadataUpdate,
         #[clap(flatten)]
         tx_args: TxProcessingArgs,
+    },
+    /// Build, but never sign, the atomic next-epoch transaction for a validator promotion.
+    #[clap(name = "prepare-validator-promotion")]
+    PrepareValidatorPromotion {
+        /// Public target metadata and proof of possession for the backup key.
+        #[clap(name = "target-path", long)]
+        target_path: PathBuf,
+        /// New file that will bind the unsigned transaction to the source epoch and committee.
+        #[clap(name = "draft-path", long)]
+        draft_path: PathBuf,
+        /// Gas budget for the unsigned transaction.
+        #[clap(name = "gas-budget", long)]
+        gas_budget: Option<u64>,
+    },
+    /// Verify a finalized promotion transaction and write the node authorization manifest.
+    #[clap(name = "finalize-validator-promotion")]
+    FinalizeValidatorPromotion {
+        #[clap(name = "draft-path", long)]
+        draft_path: PathBuf,
+        #[clap(name = "transaction-digest", long)]
+        transaction_digest: TransactionDigest,
+        /// Must not already exist.
+        #[clap(name = "manifest-path", long)]
+        manifest_path: PathBuf,
     },
     /// Update gas price that is used to calculate Reference Gas Price
     #[clap(name = "update-gas-price")]
@@ -234,6 +295,16 @@ pub enum SuiValidatorCommandResponse {
     UpdateMetadata {
         response: Option<ExecutedTransaction>,
         serialized_unsigned_transaction: Option<String>,
+    },
+    PrepareValidatorPromotion {
+        transaction_digest: TransactionDigest,
+        serialized_unsigned_transaction: String,
+        draft_path: PathBuf,
+    },
+    FinalizeValidatorPromotion {
+        transaction_digest: TransactionDigest,
+        checkpoint_sequence_number: u64,
+        manifest_path: PathBuf,
     },
     UpdateGasPrice {
         response: Option<ExecutedTransaction>,
@@ -485,6 +556,41 @@ impl SuiValidatorCommand {
                 SuiValidatorCommandResponse::UpdateMetadata {
                     response,
                     serialized_unsigned_transaction,
+                }
+            }
+
+            SuiValidatorCommand::PrepareValidatorPromotion {
+                target_path,
+                draft_path,
+                gas_budget,
+            } => {
+                let (transaction, draft) = prepare_validator_promotion(
+                    context,
+                    &target_path,
+                    gas_budget.unwrap_or(DEFAULT_GAS_BUDGET),
+                )
+                .await?;
+                write_new_json(&draft_path, &draft)?;
+                SuiValidatorCommandResponse::PrepareValidatorPromotion {
+                    transaction_digest: transaction.digest(),
+                    serialized_unsigned_transaction: Base64::encode(bcs::to_bytes(&transaction)?),
+                    draft_path,
+                }
+            }
+
+            SuiValidatorCommand::FinalizeValidatorPromotion {
+                draft_path,
+                transaction_digest,
+                manifest_path,
+            } => {
+                let manifest =
+                    finalize_validator_promotion(context, &draft_path, transaction_digest).await?;
+                let checkpoint_sequence_number = manifest.evidence.checkpoint_sequence_number;
+                write_new_json(&manifest_path, &manifest)?;
+                SuiValidatorCommandResponse::FinalizeValidatorPromotion {
+                    transaction_digest,
+                    checkpoint_sequence_number,
+                    manifest_path,
                 }
             }
 
@@ -901,6 +1007,490 @@ async fn get_validator_summary_from_cap_id(
     Ok((status, summary))
 }
 
+const PROMOTION_FUNCTIONS: [&str; 7] = [
+    "update_validator_next_epoch_protocol_pubkey",
+    "update_validator_next_epoch_network_pubkey",
+    "update_validator_next_epoch_worker_pubkey",
+    "update_validator_next_epoch_network_address",
+    "update_validator_next_epoch_p2p_address",
+    "update_validator_next_epoch_primary_address",
+    "update_validator_next_epoch_worker_address",
+];
+
+async fn prepare_validator_promotion(
+    context: &mut WalletContext,
+    target_path: &PathBuf,
+    gas_budget: u64,
+) -> Result<(TransactionData, ValidatorPromotionDraft)> {
+    let target: ValidatorPromotionTargetRequest = load_structured(target_path)?;
+    validate_promotion_target_request(&target)?;
+    let sender = context.active_address()?;
+    anyhow::ensure!(
+        sender == target.validator_address,
+        "active client address must be the validator account in the promotion target"
+    );
+
+    let client = context.grpc_client()?;
+    let system_state = client.get_system_state_summary(None).await?;
+    let (status, validator) = get_validator_summary(&client, sender)
+        .await?
+        .context("promotion sender is not a validator")?;
+    anyhow::ensure!(
+        status == ValidatorStatus::Active,
+        "only an active validator can prepare a promotion"
+    );
+    ensure_no_pending_metadata_rotation(&validator)?;
+
+    let source_protocol = validator
+        .protocol_public_key
+        .as_deref()
+        .context("validator protocol public key is missing")?;
+    anyhow::ensure!(
+        source_protocol != parse_canonical_hex(&target.target.protocol_public_key)?.as_slice(),
+        "source and target protocol public keys must be distinct"
+    );
+
+    let chain = client.get_chain_identifier().await?;
+    let source_epoch = system_state.epoch;
+    let draft = ValidatorPromotionDraft {
+        version: VALIDATOR_PROMOTION_MANIFEST_VERSION,
+        plan_id: target.plan_id,
+        chain_identifier: Hex::encode(chain.as_bytes()),
+        source_epoch,
+        activation_epoch: source_epoch.saturating_add(1),
+        validator_address: sender,
+        source_protocol_public_key: Hex::encode(source_protocol),
+        target: target.target,
+        proof_of_possession: target.proof_of_possession,
+    };
+
+    let gas = get_gas_obj_ref(sender, &client, gas_budget).await?;
+    let gas_price = client.get_reference_gas_price().await?;
+    let transaction = TransactionData::new_with_gas_data_and_expiration(
+        build_promotion_transaction_kind(&draft)?,
+        sender,
+        GasData {
+            payment: vec![gas],
+            owner: sender,
+            price: gas_price,
+            budget: gas_budget,
+        },
+        TransactionExpiration::ValidDuring {
+            min_epoch: Some(source_epoch),
+            max_epoch: Some(source_epoch),
+            min_timestamp: None,
+            max_timestamp: None,
+            chain,
+            nonce: rand::random(),
+        },
+    );
+    validate_prepared_promotion_transaction(&transaction, &draft, chain)?;
+    Ok((transaction, draft))
+}
+
+async fn finalize_validator_promotion(
+    context: &mut WalletContext,
+    draft_path: &PathBuf,
+    transaction_digest: TransactionDigest,
+) -> Result<ValidatorPromotionManifest> {
+    let draft: ValidatorPromotionDraft = load_structured(draft_path)?;
+    anyhow::ensure!(
+        draft.version == VALIDATOR_PROMOTION_MANIFEST_VERSION,
+        "unsupported validator promotion draft version"
+    );
+
+    let mut client = context.grpc_client()?;
+    let chain = client.get_chain_identifier().await?;
+    anyhow::ensure!(
+        draft.chain_identifier == Hex::encode(chain.as_bytes()),
+        "promotion draft chain identifier mismatch"
+    );
+    let system_state = client.get_system_state_summary(None).await?;
+    anyhow::ensure!(
+        system_state.epoch == draft.source_epoch,
+        "promotion must be finalized and installed before the source epoch ends"
+    );
+
+    let executed = client.get_transaction(&transaction_digest).await?;
+    anyhow::ensure!(
+        executed.transaction.digest() == transaction_digest,
+        "promotion transaction digest mismatch"
+    );
+    anyhow::ensure!(
+        executed.effects.status().is_ok(),
+        "promotion transaction did not execute successfully"
+    );
+    validate_prepared_promotion_transaction(&executed.transaction, &draft, chain)?;
+    let checkpoint_sequence_number = executed
+        .checkpoint
+        .context("promotion transaction is not finalized in a checkpoint")?;
+    let checkpoint = client
+        .get_checkpoint_summary(checkpoint_sequence_number)
+        .await?;
+    anyhow::ensure!(
+        checkpoint.epoch() == draft.source_epoch,
+        "promotion transaction finalized outside the source epoch"
+    );
+
+    let (status, validator) = get_validator_summary(&client, draft.validator_address)
+        .await?
+        .context("promotion validator is absent after transaction finality")?;
+    anyhow::ensure!(
+        status == ValidatorStatus::Active,
+        "promotion validator is no longer active"
+    );
+    ensure_target_metadata_is_staged(&validator, &draft)?;
+
+    Ok(ValidatorPromotionManifest {
+        version: draft.version,
+        plan_id: draft.plan_id,
+        chain_identifier: draft.chain_identifier,
+        source_epoch: draft.source_epoch,
+        activation_epoch: draft.activation_epoch,
+        validator_address: draft.validator_address,
+        source_protocol_public_key: draft.source_protocol_public_key,
+        target: draft.target,
+        proof_of_possession: draft.proof_of_possession,
+        evidence: ValidatorPromotionEvidence {
+            transaction_digest,
+            checkpoint_sequence_number,
+        },
+    })
+}
+
+fn validate_promotion_target_request(target: &ValidatorPromotionTargetRequest) -> Result<()> {
+    anyhow::ensure!(
+        !target.plan_id.is_empty()
+            && target.plan_id.len() <= 128
+            && target
+                .plan_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "promotion plan ID must contain 1-128 ASCII letters, digits, '-' or '_'"
+    );
+    let protocol =
+        AuthorityPublicKey::from_bytes(&parse_canonical_hex(&target.target.protocol_public_key)?)?;
+    let network =
+        NetworkPublicKey::from_bytes(&parse_canonical_hex(&target.target.network_public_key)?)?;
+    let worker =
+        NetworkPublicKey::from_bytes(&parse_canonical_hex(&target.target.worker_public_key)?)?;
+    anyhow::ensure!(
+        network != worker,
+        "target network and worker keys must differ"
+    );
+    let pop = AuthoritySignature::from_bytes(&parse_canonical_hex(&target.proof_of_possession)?)?;
+    verify_proof_of_possession(&pop, &protocol, target.validator_address)?;
+    anyhow::ensure!(
+        target.target.network_address.is_loosely_valid_tcp_addr(),
+        "target network address must be a TCP address"
+    );
+    for (name, address) in [
+        ("p2p", &target.target.p2p_address),
+        ("primary", &target.target.primary_address),
+        ("worker", &target.target.worker_address),
+    ] {
+        address
+            .to_anemo_address()
+            .map_err(|error| anyhow!("target {name} address must be a UDP address: {error}"))?;
+    }
+    Ok(())
+}
+
+fn build_promotion_transaction_kind(draft: &ValidatorPromotionDraft) -> Result<TransactionKind> {
+    let mut builder = ProgrammableTransactionBuilder::new();
+    for function in PROMOTION_FUNCTIONS {
+        let mut arguments = vec![builder.input(CallArg::SUI_SYSTEM_MUT)?];
+        for value in promotion_pure_arguments(function, draft)? {
+            arguments.push(builder.input(CallArg::Pure(value))?);
+        }
+        builder.programmable_move_call(
+            SUI_SYSTEM_PACKAGE_ID,
+            Identifier::from_str("sui_system")?,
+            Identifier::from_str(function)?,
+            vec![],
+            arguments,
+        );
+    }
+    Ok(TransactionKind::programmable(builder.finish()))
+}
+
+fn ensure_no_pending_metadata_rotation(validator: &proto::Validator) -> Result<()> {
+    for (name, current, next) in [
+        (
+            "protocol public key",
+            validator.protocol_public_key.as_deref(),
+            validator.next_epoch_protocol_public_key.as_deref(),
+        ),
+        (
+            "proof of possession",
+            validator.proof_of_possession.as_deref(),
+            validator.next_epoch_proof_of_possession.as_deref(),
+        ),
+        (
+            "network public key",
+            validator.network_public_key.as_deref(),
+            validator.next_epoch_network_public_key.as_deref(),
+        ),
+        (
+            "worker public key",
+            validator.worker_public_key.as_deref(),
+            validator.next_epoch_worker_public_key.as_deref(),
+        ),
+    ] {
+        anyhow::ensure!(
+            current.is_some() && current == next,
+            "validator already has a pending {name} change"
+        );
+    }
+    for (name, current, next) in [
+        (
+            "network address",
+            validator.network_address.as_deref(),
+            validator.next_epoch_network_address.as_deref(),
+        ),
+        (
+            "p2p address",
+            validator.p2p_address.as_deref(),
+            validator.next_epoch_p2p_address.as_deref(),
+        ),
+        (
+            "primary address",
+            validator.primary_address.as_deref(),
+            validator.next_epoch_primary_address.as_deref(),
+        ),
+        (
+            "worker address",
+            validator.worker_address.as_deref(),
+            validator.next_epoch_worker_address.as_deref(),
+        ),
+    ] {
+        anyhow::ensure!(
+            current.is_some() && current == next,
+            "validator already has a pending {name} change"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_target_metadata_is_staged(
+    validator: &proto::Validator,
+    draft: &ValidatorPromotionDraft,
+) -> Result<()> {
+    let target = &draft.target;
+    for (name, actual, expected) in [
+        (
+            "protocol public key",
+            validator.next_epoch_protocol_public_key.as_deref(),
+            parse_canonical_hex(&target.protocol_public_key)?,
+        ),
+        (
+            "proof of possession",
+            validator.next_epoch_proof_of_possession.as_deref(),
+            parse_canonical_hex(&draft.proof_of_possession)?,
+        ),
+        (
+            "network public key",
+            validator.next_epoch_network_public_key.as_deref(),
+            parse_canonical_hex(&target.network_public_key)?,
+        ),
+        (
+            "worker public key",
+            validator.next_epoch_worker_public_key.as_deref(),
+            parse_canonical_hex(&target.worker_public_key)?,
+        ),
+    ] {
+        anyhow::ensure!(
+            actual == Some(expected.as_slice()),
+            "staged validator {name} does not match the promotion target"
+        );
+    }
+    for (name, actual, expected) in [
+        (
+            "network address",
+            validator.next_epoch_network_address.as_deref(),
+            target.network_address.to_string(),
+        ),
+        (
+            "p2p address",
+            validator.next_epoch_p2p_address.as_deref(),
+            target.p2p_address.to_string(),
+        ),
+        (
+            "primary address",
+            validator.next_epoch_primary_address.as_deref(),
+            target.primary_address.to_string(),
+        ),
+        (
+            "worker address",
+            validator.next_epoch_worker_address.as_deref(),
+            target.worker_address.to_string(),
+        ),
+    ] {
+        anyhow::ensure!(
+            actual == Some(expected.as_str()),
+            "staged validator {name} does not match the promotion target"
+        );
+    }
+    Ok(())
+}
+
+fn validate_prepared_promotion_transaction(
+    transaction: &TransactionData,
+    draft: &ValidatorPromotionDraft,
+    chain: ChainIdentifier,
+) -> Result<()> {
+    anyhow::ensure!(
+        transaction.sender() == draft.validator_address,
+        "promotion transaction sender mismatch"
+    );
+    let TransactionExpiration::ValidDuring {
+        min_epoch,
+        max_epoch,
+        min_timestamp,
+        max_timestamp,
+        chain: transaction_chain,
+        ..
+    } = transaction.expiration()
+    else {
+        bail!("promotion transaction must use ValidDuring expiration");
+    };
+    anyhow::ensure!(
+        *min_epoch == Some(draft.source_epoch)
+            && *max_epoch == Some(draft.source_epoch)
+            && min_timestamp.is_none()
+            && max_timestamp.is_none()
+            && *transaction_chain == chain,
+        "promotion transaction must be bound to the exact source epoch and chain"
+    );
+    let TransactionKind::ProgrammableTransaction(pt) = transaction.kind() else {
+        bail!("promotion transaction is not programmable");
+    };
+    anyhow::ensure!(
+        pt.commands.len() == PROMOTION_FUNCTIONS.len(),
+        "promotion transaction must contain exactly seven commands"
+    );
+    let mut functions = BTreeSet::new();
+    for command in &pt.commands {
+        let Command::MoveCall(call) = command else {
+            bail!("promotion transaction contains a non-Move command");
+        };
+        anyhow::ensure!(
+            call.package == SUI_SYSTEM_PACKAGE_ID
+                && call.module.as_str() == "sui_system"
+                && call.type_arguments.is_empty(),
+            "promotion transaction calls outside 0x3::sui_system"
+        );
+        anyhow::ensure!(
+            functions.insert(call.function.as_str()),
+            "promotion transaction contains a duplicate command"
+        );
+        let expected = promotion_pure_arguments(call.function.as_str(), draft)?;
+        anyhow::ensure!(
+            call.arguments.len() == expected.len() + 1,
+            "promotion command argument count mismatch"
+        );
+        anyhow::ensure!(
+            resolve_promotion_input(pt, call.arguments[0])? == &CallArg::SUI_SYSTEM_MUT,
+            "promotion command does not target the Sui system state"
+        );
+        for (argument, expected) in call.arguments[1..].iter().zip(expected) {
+            anyhow::ensure!(
+                resolve_promotion_input(pt, *argument)? == &CallArg::Pure(expected),
+                "promotion command argument differs from the draft"
+            );
+        }
+    }
+    anyhow::ensure!(
+        functions == PROMOTION_FUNCTIONS.into_iter().collect(),
+        "promotion transaction command set is incomplete"
+    );
+    Ok(())
+}
+
+fn promotion_pure_arguments(
+    function: &str,
+    draft: &ValidatorPromotionDraft,
+) -> Result<Vec<Vec<u8>>> {
+    let target = &draft.target;
+    Ok(match function {
+        "update_validator_next_epoch_protocol_pubkey" => vec![
+            bcs::to_bytes(&parse_canonical_hex(&target.protocol_public_key)?)?,
+            bcs::to_bytes(&parse_canonical_hex(&draft.proof_of_possession)?)?,
+        ],
+        "update_validator_next_epoch_network_pubkey" => {
+            vec![bcs::to_bytes(&parse_canonical_hex(
+                &target.network_public_key,
+            )?)?]
+        }
+        "update_validator_next_epoch_worker_pubkey" => {
+            vec![bcs::to_bytes(&parse_canonical_hex(
+                &target.worker_public_key,
+            )?)?]
+        }
+        "update_validator_next_epoch_network_address" => {
+            vec![bcs::to_bytes(&target.network_address)?]
+        }
+        "update_validator_next_epoch_p2p_address" => {
+            vec![bcs::to_bytes(&target.p2p_address)?]
+        }
+        "update_validator_next_epoch_primary_address" => {
+            vec![bcs::to_bytes(&target.primary_address)?]
+        }
+        "update_validator_next_epoch_worker_address" => {
+            vec![bcs::to_bytes(&target.worker_address)?]
+        }
+        _ => bail!("unexpected promotion function"),
+    })
+}
+
+fn resolve_promotion_input(
+    transaction: &sui_types::transaction::ProgrammableTransaction,
+    argument: Argument,
+) -> Result<&CallArg> {
+    let Argument::Input(index) = argument else {
+        bail!("promotion commands may only use transaction inputs");
+    };
+    transaction
+        .inputs
+        .get(index as usize)
+        .context("promotion command references a missing input")
+}
+
+fn parse_canonical_hex(value: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "key and proof values must use lowercase canonical hex"
+    );
+    Hex::decode(value).map_err(Into::into)
+}
+
+fn load_structured<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .or_else(|_| serde_yaml::from_slice(&bytes))
+        .with_context(|| format!("failed to parse {} as JSON or YAML", path.display()))
+}
+
+fn write_new_json(path: &PathBuf, value: &impl Serialize) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
 async fn construct_unsigned_0x5_txn(
     context: &mut WalletContext,
     sender: SuiAddress,
@@ -993,6 +1583,27 @@ impl Display for SuiValidatorCommandResponse {
                         serialized_unsigned_transaction
                     )?;
                 }
+            }
+            SuiValidatorCommandResponse::PrepareValidatorPromotion {
+                transaction_digest,
+                serialized_unsigned_transaction,
+                draft_path,
+            } => {
+                writeln!(writer, "Promotion transaction digest: {transaction_digest}")?;
+                writeln!(writer, "Promotion draft: {}", draft_path.display())?;
+                write!(
+                    writer,
+                    "Serialized unsigned transaction: {serialized_unsigned_transaction}"
+                )?;
+            }
+            SuiValidatorCommandResponse::FinalizeValidatorPromotion {
+                transaction_digest,
+                checkpoint_sequence_number,
+                manifest_path,
+            } => {
+                writeln!(writer, "Finalized transaction: {transaction_digest}")?;
+                writeln!(writer, "Checkpoint: {checkpoint_sequence_number}")?;
+                write!(writer, "Promotion manifest: {}", manifest_path.display())?;
             }
             SuiValidatorCommandResponse::SerializedPayload(response) => {
                 write!(writer, "Serialized payload: {}", response)?;
