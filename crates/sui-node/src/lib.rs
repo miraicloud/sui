@@ -891,12 +891,21 @@ impl SuiNode {
             &config.validator_role_transition.promotion_manifest_path,
             &config.validator_role_transition.promotion_state_path,
         ) {
-            (Some(manifest_path), Some(state_path)) => Some(ValidatorPromotionGuard::load(
-                manifest_path,
-                state_path.clone(),
-                chain_identifier,
-                &config,
-            )?),
+            (Some(manifest_path), Some(state_path)) if manifest_path.exists() => {
+                Some(ValidatorPromotionGuard::load(
+                    manifest_path,
+                    state_path.clone(),
+                    chain_identifier,
+                    &config,
+                )?)
+            }
+            (Some(_), Some(state_path)) => {
+                ensure!(
+                    !state_path.exists(),
+                    "promotion state exists without its immutable manifest"
+                );
+                None
+            }
             (None, None) => None,
             _ => unreachable!("validator role transition config was validated"),
         };
