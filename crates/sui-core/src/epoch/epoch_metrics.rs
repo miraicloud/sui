@@ -87,6 +87,15 @@ pub struct EpochMetrics {
     /// The number of shares held by this node after the random beacon DKG protocol completed.
     pub epoch_random_beacon_dkg_num_shares: IntGauge,
 
+    /// Whether this node has validated local shares for the current epoch.
+    pub epoch_random_beacon_local_shares_ready: IntGauge,
+
+    /// Whether the current local shares were recovered from an observer transcript.
+    pub epoch_random_beacon_recovered_shares: IntGauge,
+
+    /// Whether validated local shares have been installed in the randomness network.
+    pub epoch_random_beacon_signer_ready: IntGauge,
+
     /// The amount of time taken from epoch start to completion of random beacon DKG protocol,
     /// for the most recent epoch.
     pub epoch_random_beacon_dkg_epoch_start_completion_time_ms: IntGauge,
@@ -230,6 +239,24 @@ impl EpochMetrics {
             epoch_random_beacon_dkg_num_shares: register_int_gauge_with_registry!(
                 "epoch_random_beacon_dkg_num_shares",
                 "The number of shares held by this node after the random beacon DKG protocol completed",
+                registry
+            )
+            .unwrap(),
+            epoch_random_beacon_local_shares_ready: register_int_gauge_with_registry!(
+                "epoch_random_beacon_local_shares_ready",
+                "Whether this node has validated local random beacon shares for the current epoch",
+                registry
+            )
+            .unwrap(),
+            epoch_random_beacon_recovered_shares: register_int_gauge_with_registry!(
+                "epoch_random_beacon_recovered_shares",
+                "Whether this node's current random beacon shares were recovered from an observer transcript",
+                registry
+            )
+            .unwrap(),
+            epoch_random_beacon_signer_ready: register_int_gauge_with_registry!(
+                "epoch_random_beacon_signer_ready",
+                "Whether validated local random beacon shares have been installed in the randomness network",
                 registry
             )
             .unwrap(),
