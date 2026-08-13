@@ -113,8 +113,8 @@ use crate::consensus_handler::{
 };
 use crate::epoch::epoch_metrics::EpochMetrics;
 use crate::epoch::randomness::{
-    RandomnessManager, RandomnessReporter, SINGLETON_KEY, VersionedProcessedMessage,
-    VersionedRecoveredDkgOutput, VersionedUsedProcessedMessages,
+    RandomnessManager, RandomnessReporter, SINGLETON_KEY, VersionedLocalDkgConfirmation,
+    VersionedProcessedMessage, VersionedRecoveredDkgOutput, VersionedUsedProcessedMessages,
 };
 use crate::epoch::reconfiguration::ReconfigState;
 use crate::execution_cache::ObjectCacheRead;
@@ -523,6 +523,9 @@ pub struct AuthorityEpochTables {
     /// Records confirmations received from other nodes. Updated when receiving a new
     /// dkg::Confirmation via consensus.
     pub(crate) dkg_confirmations_v2: DBMap<PartyId, VersionedDkgConfirmation>,
+    /// Holds an identical local confirmation for resubmission when promotion happens after an
+    /// observer persisted its used-message set but before this validator's confirmation committed.
+    pub(crate) dkg_local_confirmation_v1: DBMap<u64, VersionedLocalDkgConfirmation>,
     /// Holds private DKG shares reconstructed locally after an observer is promoted to a
     /// validator. This table is not written by consensus replay and must never replace
     /// `dkg_output_v2`.
@@ -729,6 +732,10 @@ impl AuthorityEpochTables {
             (
                 "dkg_confirmations_v2".to_string(),
                 ThConfig::new(2, 1, KeyType::uniform(1)),
+            ),
+            (
+                "dkg_local_confirmation_v1".to_string(),
+                ThConfig::new(8, 1, KeyType::uniform(1)),
             ),
             (
                 "dkg_recovered_output_v1".to_string(),

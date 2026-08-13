@@ -109,10 +109,33 @@ pub(crate) struct RecoveredDkgOutputV1 {
     output: Output<PkG, EncG>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum VersionedLocalDkgConfirmation {
+    V1(LocalDkgConfirmationV1),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct LocalDkgConfirmationV1 {
+    epoch: EpochId,
+    dkg_version: u64,
+    authority: AuthorityName,
+    party_id: PartyId,
+    used_messages_digest: [u8; 32],
+    confirmation: VersionedDkgConfirmation,
+}
+
 impl VersionedRecoveredDkgOutput {
     fn into_v1(self) -> RecoveredDkgOutputV1 {
         match self {
             Self::V1(output) => output,
+        }
+    }
+}
+
+impl VersionedLocalDkgConfirmation {
+    fn into_v1(self) -> LocalDkgConfirmationV1 {
+        match self {
+            Self::V1(confirmation) => confirmation,
         }
     }
 }
@@ -433,6 +456,20 @@ fn dkg_transcript_digest(
     Ok(Blake2b256::digest(&bytes).into())
 }
 
+fn dkg_used_messages_digest(
+    used_messages: &VersionedUsedProcessedMessages,
+) -> FastCryptoResult<[u8; 32]> {
+    let raw_messages = used_messages
+        .as_v1()
+        .ok_or(FastCryptoError::InvalidInput)?
+        .0
+        .iter()
+        .map(|message| &message.message)
+        .collect::<Vec<_>>();
+    let bytes = bcs::to_bytes(&raw_messages).map_err(|_| FastCryptoError::InvalidInput)?;
+    Ok(Blake2b256::digest(&bytes).into())
+}
+
 // State machine for randomness DKG and generation.
 //
 // DKG protocol:
@@ -466,6 +503,7 @@ pub struct RandomnessManager {
     processed_messages: BTreeMap<PartyId, VersionedProcessedMessage>,
     used_messages: OnceCell<VersionedUsedProcessedMessages>,
     confirmations: BTreeMap<PartyId, VersionedDkgConfirmation>,
+    local_confirmation_to_resend: Option<VersionedDkgConfirmation>,
     dkg_output: OnceCell<Option<dkg_v1::Output<PkG, EncG>>>,
     local_participation: LocalRandomnessParticipation,
 
@@ -614,6 +652,7 @@ impl RandomnessManager {
             processed_messages: BTreeMap::new(),
             used_messages: OnceCell::new(),
             confirmations: BTreeMap::new(),
+            local_confirmation_to_resend: None,
             dkg_output: OnceCell::new(),
             local_participation: if role.is_observer() {
                 LocalRandomnessParticipation::Observer
@@ -798,6 +837,65 @@ impl RandomnessManager {
                         .safe_iter()
                         .map(|result| result.expect("typed_store should not fail")),
                 );
+                if rm.role.is_party() && rm.used_messages.initialized() {
+                    let party_id = rm.role.party_id().ok()?;
+                    if !rm.confirmations.contains_key(&party_id) {
+                        let used_messages = rm.used_messages.get()?;
+                        let used_messages_digest = dkg_used_messages_digest(used_messages).ok()?;
+                        let confirmation = if let Some(record) = tables
+                            .dkg_local_confirmation_v1
+                            .get(&SINGLETON_KEY)
+                            .expect("typed_store should not fail")
+                        {
+                            let record = record.into_v1();
+                            if record.epoch != committee.epoch()
+                                || record.dkg_version != protocol_config.dkg_version()
+                                || record.authority != epoch_store.name
+                                || record.party_id != party_id
+                                || record.used_messages_digest != used_messages_digest
+                                || !record
+                                    .confirmation
+                                    .is_valid_version(protocol_config.dkg_version())
+                                || record.confirmation.sender() != party_id
+                            {
+                                error!(
+                                    "random beacon: local DKG confirmation journal does not match epoch, authority, party, or used messages"
+                                );
+                                return None;
+                            }
+                            record.confirmation
+                        } else {
+                            let processed_messages = used_messages
+                                .as_v1()?
+                                .0
+                                .iter()
+                                .cloned()
+                                .map(VersionedProcessedMessage::V1)
+                                .collect();
+                            let (confirmation, _) =
+                                rm.role.merge_messages(processed_messages).ok()?;
+                            let confirmation = confirmation?;
+                            let record =
+                                VersionedLocalDkgConfirmation::V1(LocalDkgConfirmationV1 {
+                                    epoch: committee.epoch(),
+                                    dkg_version: protocol_config.dkg_version(),
+                                    authority: epoch_store.name,
+                                    party_id,
+                                    used_messages_digest,
+                                    confirmation: confirmation.clone(),
+                                });
+                            tables
+                                .dkg_local_confirmation_v1
+                                .insert(&SINGLETON_KEY, &record)
+                                .ok()?;
+                            confirmation
+                        };
+                        info!(
+                            "random beacon: prepared durable local DKG confirmation for resubmission"
+                        );
+                        rm.local_confirmation_to_resend = Some(confirmation);
+                    }
+                }
             }
         }
 
@@ -854,6 +952,21 @@ impl RandomnessManager {
             }
             DkgRole::Party(party) => party,
         };
+
+        if let Some(confirmation) = &self.local_confirmation_to_resend {
+            let epoch_store = self.epoch_store()?;
+            let transaction = ConsensusTransaction::new_randomness_dkg_confirmation(
+                epoch_store.name,
+                confirmation,
+            );
+            info!(
+                "random beacon: resubmitting durable local DKG confirmation with {} complaints",
+                confirmation.num_of_complaints()
+            );
+            self.consensus_adapter
+                .submit_to_consensus(&[transaction], &epoch_store)?;
+            return Ok(());
+        }
 
         if self.used_messages.initialized() || self.dkg_output.initialized() {
             // DKG already started (or completed or failed).
@@ -1217,6 +1330,9 @@ impl RandomnessManager {
             );
             return Ok(());
         }
+        if self.role.party_id().ok() == Some(conf.sender()) {
+            self.local_confirmation_to_resend = None;
+        }
         self.confirmations.insert(conf.sender(), conf.clone());
         output.insert_dkg_confirmation(conf);
         Ok(())
@@ -1409,7 +1525,7 @@ mod tests {
     use consensus_types::block::BlockRef;
     use fastcrypto::groups::bls12381;
     use fastcrypto::serde_helpers::ToFromByteArray;
-    use fastcrypto_tbls::{mocked_dkg, nodes};
+    use fastcrypto_tbls::{ecies_v1, mocked_dkg, nizk, nodes};
     use std::num::NonZeroUsize;
     use sui_protocol_config::ProtocolConfig;
     use sui_protocol_config::{Chain, ProtocolVersion};
@@ -1418,6 +1534,29 @@ mod tests {
     use typed_store::Map;
 
     use arc_swap::Guard;
+
+    #[derive(Serialize, Deserialize)]
+    struct TestMultiRecipientEncryption {
+        c: bls12381::G2Element,
+        c_hat: bls12381::G2Element,
+        encs: Vec<ecies_v1::Ciphertext>,
+        proof: nizk::DdhTupleNizk<bls12381::G2Element>,
+    }
+
+    fn corrupt_encrypted_share_for_receiver(message: &mut VersionedDkgMessage, receiver: usize) {
+        let VersionedDkgMessage::V1(message) = message else {
+            panic!("expected V1 DKG message");
+        };
+        let mut encryption: TestMultiRecipientEncryption = bcs::from_bytes(
+            &bcs::to_bytes(&message.encrypted_shares)
+                .expect("DKG encrypted shares should serialize"),
+        )
+        .expect("test representation must match MultiRecipientEncryption");
+        encryption.encs[receiver].0[0] ^= 1;
+        message.encrypted_shares =
+            bcs::from_bytes(&bcs::to_bytes(&encryption).expect("test encryption should serialize"))
+                .expect("test representation must deserialize as MultiRecipientEncryption");
+    }
 
     /// Test harness that sets up validators (and optionally an observer) with mock consensus,
     /// ready for DKG message exchange.
@@ -1940,6 +2079,42 @@ mod tests {
             )
             .unwrap()
         );
+        assert_eq!(
+            1,
+            setup.epoch_stores[0]
+                .metrics
+                .epoch_random_beacon_signer_ready
+                .get()
+        );
+
+        tables
+            .dkg_recovered_output_v1
+            .remove(&SINGLETON_KEY)
+            .unwrap();
+        let recovered_after_missing_overlay = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            LocalRandomnessParticipation::RecoveredShares,
+            recovered_after_missing_overlay.local_randomness_participation()
+        );
+        assert_eq!(
+            overlay_before_restart,
+            bcs::to_bytes(
+                &tables
+                    .dkg_recovered_output_v1
+                    .get(&SINGLETON_KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+        );
 
         let mut tampered_overlay = tables
             .dkg_recovered_output_v1
@@ -1964,6 +2139,189 @@ mod tests {
         )
         .await;
         assert!(tampered_recovery.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_observer_output_recovers_after_valid_dealer_complaint() {
+        telemetry_subscribers::init_for_testing();
+
+        let mut setup = DkgTestSetup::new(true).await;
+        let mut dkg_messages = setup.start_dkg_and_collect_messages().await;
+        let promoted_receiver = 0;
+        let promoted_party_id = setup.randomness_managers[promoted_receiver]
+            .role
+            .party_id()
+            .unwrap();
+        let accused_party_id = (promoted_party_id + 1) % setup.num_validators as PartyId;
+        let accused_message = dkg_messages
+            .iter_mut()
+            .find(|message| message.sender() == accused_party_id)
+            .unwrap();
+        corrupt_encrypted_share_for_receiver(accused_message, promoted_party_id as usize);
+        setup
+            .distribute_messages_and_advance(&dkg_messages, 0)
+            .await;
+
+        let promoted_processed_message = setup.randomness_managers[promoted_receiver]
+            .processed_messages
+            .get(&accused_party_id)
+            .unwrap()
+            .as_v1()
+            .unwrap();
+        assert!(promoted_processed_message.complaint.is_some());
+
+        setup.collect_and_distribute_confirmations().await;
+        let expected_output = setup.randomness_managers[promoted_receiver]
+            .dkg_output()
+            .unwrap()
+            .clone();
+        assert!(expected_output.shares.is_some());
+        assert!(
+            setup.epoch_stores[promoted_receiver]
+                .tables()
+                .unwrap()
+                .dkg_confirmations_v2
+                .safe_iter()
+                .map(|entry| entry.unwrap().1)
+                .any(|confirmation| confirmation.num_of_complaints() > 0)
+        );
+
+        let persisted_observer_output = setup.epoch_stores[promoted_receiver]
+            .tables()
+            .unwrap()
+            .dkg_output_v2
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .flatten()
+            .unwrap();
+        assert!(persisted_observer_output.shares.is_none());
+
+        let recovered = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[promoted_receiver]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[promoted_receiver].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[promoted_receiver].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        let recovered_output = recovered.dkg_output().unwrap();
+        assert_eq!(
+            LocalRandomnessParticipation::RecoveredShares,
+            recovered.local_randomness_participation()
+        );
+        assert_eq!(expected_output.nodes, recovered_output.nodes);
+        assert_eq!(expected_output.vss_pk, recovered_output.vss_pk);
+        assert_eq!(expected_output.shares, recovered_output.shares);
+    }
+
+    #[tokio::test]
+    async fn test_zero_weight_party_recovery_fails_closed_without_shares() {
+        telemetry_subscribers::init_for_testing();
+
+        let network_config =
+            sui_swarm_config::network_config_builder::ConfigBuilder::new_with_temp_dir()
+                .committee_size(NonZeroUsize::new(4).unwrap())
+                .with_reference_gas_price(500)
+                .build();
+        let nodes = nodes::Nodes::new(
+            network_config
+                .validator_configs
+                .iter()
+                .enumerate()
+                .map(|(id, validator)| {
+                    let public_key = bls12381::G2Element::from_byte_array(
+                        validator
+                            .protocol_key_pair()
+                            .public()
+                            .as_bytes()
+                            .try_into()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    nodes::Node::<EncG> {
+                        id: id as PartyId,
+                        pk: ecies_v1::PublicKey::from(public_key),
+                        weight: if id == 0 { 0 } else { 2 },
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let threshold = 2;
+        let oracle =
+            fastcrypto_tbls::random_oracle::RandomOracle::new("test_zero_weight_party_recovery");
+        let roles = network_config
+            .validator_configs
+            .iter()
+            .map(|validator| {
+                DkgRole::try_new(
+                    Some(validator.protocol_key_pair()),
+                    nodes.clone(),
+                    threshold,
+                    oracle.clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let messages = roles
+            .iter()
+            .filter_map(|role| {
+                let DkgRole::Party(party) = role else {
+                    unreachable!();
+                };
+                match VersionedDkgMessage::create(1, party) {
+                    Ok(message) => Some(message),
+                    Err(FastCryptoError::IgnoredMessage) => None,
+                    Err(error) => panic!("unexpected DKG message error: {error:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roles.len() - 1, messages.len());
+
+        let merged = roles
+            .iter()
+            .map(|role| {
+                let processed = messages
+                    .iter()
+                    .cloned()
+                    .map(|message| role.process_message(message).unwrap())
+                    .collect();
+                role.merge_messages(processed).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let confirmations = merged
+            .iter()
+            .skip(1)
+            .map(|(confirmation, _)| confirmation.clone().unwrap())
+            .collect::<Vec<_>>();
+
+        let observer =
+            DkgRole::try_new(None, nodes, threshold, oracle).expect("observer should initialize");
+        let observer_processed = messages
+            .iter()
+            .cloned()
+            .map(|message| observer.process_message(message).unwrap())
+            .collect();
+        let (_, observer_used_messages) = observer
+            .merge_messages(observer_processed)
+            .expect("observer should merge nonzero-weight dealer messages");
+        let public_output = observer
+            .complete_dkg(&observer_used_messages, confirmations.iter())
+            .expect("observer should derive public output");
+
+        let recovered_output = roles[0]
+            .recover_party_output(&observer_used_messages, &confirmations)
+            .expect("zero-weight party should reproduce the public output");
+        assert_eq!(public_output.nodes, recovered_output.nodes);
+        assert_eq!(public_output.vss_pk, recovered_output.vss_pk);
+        assert!(recovered_output.shares.is_none());
+        assert!(
+            roles[0]
+                .validate_party_output(&recovered_output, &public_output)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1992,7 +2350,20 @@ mod tests {
                 .all(|message| message.shares.is_empty())
         );
 
-        let promoted = RandomnessManager::try_new(
+        let mut committed_confirmations = BTreeMap::new();
+        for _ in 0..setup.num_validators {
+            let mut transactions = setup.rx_consensus.recv().await.unwrap();
+            assert_eq!(1, transactions.len());
+            let ConsensusTransactionKind::RandomnessDkgConfirmation(_, bytes) =
+                transactions.remove(0).kind
+            else {
+                panic!("expected DKG confirmation");
+            };
+            let confirmation: VersionedDkgConfirmation = bcs::from_bytes(&bytes).unwrap();
+            committed_confirmations.insert(confirmation.sender(), confirmation);
+        }
+
+        let mut promoted = RandomnessManager::try_new(
             Arc::downgrade(&setup.epoch_stores[0]),
             Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
             sui_network::randomness::Handle::new_stub(),
@@ -2006,6 +2377,7 @@ mod tests {
             promoted.local_randomness_participation()
         );
         assert!(!promoted.local_randomness_participation().can_sign());
+        assert!(promoted.local_confirmation_to_resend.is_some());
         let promoted_used_messages = promoted.used_messages.get().unwrap();
         assert!(
             promoted_used_messages
@@ -2018,6 +2390,107 @@ mod tests {
         assert_eq!(
             setup.randomness_managers[0].used_messages.get().unwrap(),
             promoted_used_messages
+        );
+
+        promoted.start_dkg().await.unwrap();
+        let mut first_resubmission = setup.rx_consensus.recv().await.unwrap();
+        assert_eq!(1, first_resubmission.len());
+        let ConsensusTransactionKind::RandomnessDkgConfirmation(_, first_bytes) =
+            first_resubmission.remove(0).kind
+        else {
+            panic!("expected resubmitted DKG confirmation");
+        };
+
+        let tables = setup.epoch_stores[0].tables().unwrap();
+        let journal = tables
+            .dkg_local_confirmation_v1
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .unwrap();
+        let mut tampered_journal = journal.clone().into_v1();
+        tampered_journal.used_messages_digest[0] ^= 1;
+        tables
+            .dkg_local_confirmation_v1
+            .insert(
+                &SINGLETON_KEY,
+                &VersionedLocalDkgConfirmation::V1(tampered_journal),
+            )
+            .unwrap();
+        let tampered_restart = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await;
+        assert!(tampered_restart.is_none());
+        tables
+            .dkg_local_confirmation_v1
+            .insert(&SINGLETON_KEY, &journal)
+            .unwrap();
+
+        let mut promoted_after_restart = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        promoted_after_restart.start_dkg().await.unwrap();
+        let mut second_resubmission = setup.rx_consensus.recv().await.unwrap();
+        assert_eq!(1, second_resubmission.len());
+        let ConsensusTransactionKind::RandomnessDkgConfirmation(_, second_bytes) =
+            second_resubmission.remove(0).kind
+        else {
+            panic!("expected journaled DKG confirmation after restart");
+        };
+        assert_eq!(first_bytes, second_bytes);
+
+        let local_confirmation: VersionedDkgConfirmation = bcs::from_bytes(&first_bytes).unwrap();
+        committed_confirmations.insert(local_confirmation.sender(), local_confirmation);
+        let mut output = ConsensusCommitOutput::new(0);
+        output.record_consensus_commit_stats(ExecutionIndicesWithStatsV2 {
+            index: ExecutionIndices {
+                last_committed_round: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for confirmation in committed_confirmations.into_values() {
+            let authority = promoted_after_restart
+                .authority_info
+                .iter()
+                .find_map(|(authority, (_, party_id))| {
+                    (*party_id == confirmation.sender()).then_some(*authority)
+                })
+                .unwrap();
+            promoted_after_restart
+                .add_confirmation(&mut output, &authority, confirmation)
+                .unwrap();
+        }
+        promoted_after_restart
+            .advance_dkg(&mut output, 1)
+            .await
+            .unwrap();
+        let mut batch = setup.epoch_stores[0].db_batch_for_test();
+        output
+            .write_to_batch(&setup.epoch_stores[0], &mut batch)
+            .unwrap();
+        batch.write().unwrap();
+        assert_eq!(DkgStatus::Successful, promoted_after_restart.dkg_status());
+        assert_eq!(
+            LocalRandomnessParticipation::NativeShares,
+            promoted_after_restart.local_randomness_participation()
+        );
+        assert!(
+            promoted_after_restart
+                .dkg_output()
+                .unwrap()
+                .shares
+                .is_some()
         );
 
         setup.epoch_stores[0]
