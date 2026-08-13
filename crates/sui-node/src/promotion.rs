@@ -742,6 +742,47 @@ mod tests {
     }
 
     #[test]
+    fn durable_state_survives_restart_and_rejects_manifest_replacement() {
+        let (mut manifest, config, _, chain) = test_manifest();
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("manifest.json");
+        let state_path = directory.path().join("state.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut guard =
+            ValidatorPromotionGuard::load(&manifest_path, state_path.clone(), chain, &config)
+                .unwrap();
+        assert_eq!(guard.state().phase(), ValidatorPromotionPhase::Prepared);
+        guard.retire(43).unwrap();
+        drop(guard);
+
+        let guard =
+            ValidatorPromotionGuard::load(&manifest_path, state_path.clone(), chain, &config)
+                .unwrap();
+        assert_eq!(guard.state().phase(), ValidatorPromotionPhase::Retired);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        manifest.plan_id = "replacement-plan".to_string();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(ValidatorPromotionGuard::load(&manifest_path, state_path, chain, &config).is_err());
+    }
+
+    #[test]
     fn promotion_transaction_is_atomic_complete_and_exact_epoch_bound() {
         let (manifest, _, _, chain) = test_manifest();
         let mut inputs = vec![CallArg::SUI_SYSTEM_MUT];
