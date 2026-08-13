@@ -5,9 +5,13 @@ use anemo::PeerId;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::bls12381;
+use fastcrypto::hash::{Blake2b256, HashFunction};
 use fastcrypto::serde_helpers::ToFromByteArray;
 use fastcrypto::traits::{KeyPair, ToFromBytes};
-use fastcrypto_tbls::{dkg_v1, dkg_v1::Output, nodes, nodes::PartyId};
+use fastcrypto_tbls::{
+    dkg_v1, dkg_v1::Output, nodes, nodes::PartyId, tbls::ThresholdBls,
+    types::ThresholdBls12381MinSig,
+};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use mysten_common::debug_fatal;
@@ -85,6 +89,32 @@ impl VersionedProcessedMessage {
 pub enum VersionedUsedProcessedMessages {
     V0(), // deprecated
     V1(dkg_v1::UsedProcessedMessages<PkG, EncG>),
+}
+
+/// Local-only private DKG material recovered after a consensus observer is promoted to a
+/// validator. This must remain separate from `dkg_output_v2`, which is consensus-owned and may
+/// legitimately contain only the public DKG output.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum VersionedRecoveredDkgOutput {
+    V1(RecoveredDkgOutputV1),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RecoveredDkgOutputV1 {
+    epoch: EpochId,
+    dkg_version: u64,
+    authority: AuthorityName,
+    party_id: PartyId,
+    transcript_digest: [u8; 32],
+    output: Output<PkG, EncG>,
+}
+
+impl VersionedRecoveredDkgOutput {
+    fn into_v1(self) -> RecoveredDkgOutputV1 {
+        match self {
+            Self::V1(output) => output,
+        }
+    }
 }
 
 impl VersionedUsedProcessedMessages {
@@ -280,6 +310,127 @@ impl DkgRole {
             }
         }
     }
+
+    fn recover_party_output(
+        &self,
+        used_messages: &VersionedUsedProcessedMessages,
+        confirmations: &[VersionedDkgConfirmation],
+    ) -> FastCryptoResult<Output<PkG, EncG>> {
+        let DkgRole::Party(party) = self else {
+            return Err(FastCryptoError::InvalidInput);
+        };
+        let used_messages = used_messages.as_v1().ok_or(FastCryptoError::InvalidInput)?;
+        let recovered_messages = used_messages
+            .0
+            .iter()
+            .map(|message| party.process_message(message.message.clone(), &mut rand::thread_rng()))
+            .collect::<FastCryptoResult<Vec<_>>>()?;
+        let recovered_messages = dkg_v1::UsedProcessedMessages(recovered_messages);
+        let confirmations = confirmations
+            .iter()
+            .map(|confirmation| {
+                confirmation
+                    .as_v1()
+                    .ok_or(FastCryptoError::InvalidInput)
+                    .cloned()
+            })
+            .collect::<FastCryptoResult<Vec<_>>>()?;
+        let rng = &mut StdRng::from_rng(OsRng).expect("RNG construction should not fail");
+        party.complete(&recovered_messages, &confirmations, rng)
+    }
+
+    fn reprocess_party_message(
+        &self,
+        processed_message: &VersionedProcessedMessage,
+    ) -> FastCryptoResult<VersionedProcessedMessage> {
+        let raw_message = processed_message
+            .as_v1()
+            .ok_or(FastCryptoError::InvalidInput)?
+            .message
+            .clone();
+        self.process_message(VersionedDkgMessage::V1(raw_message))
+    }
+
+    fn reprocess_party_used_messages(
+        &self,
+        used_messages: &VersionedUsedProcessedMessages,
+    ) -> FastCryptoResult<VersionedUsedProcessedMessages> {
+        let used_messages = used_messages.as_v1().ok_or(FastCryptoError::InvalidInput)?;
+        let processed_messages = used_messages
+            .0
+            .iter()
+            .map(|message| {
+                self.reprocess_party_message(&VersionedProcessedMessage::V1(message.clone()))
+            })
+            .collect::<FastCryptoResult<Vec<_>>>()?
+            .into_iter()
+            .map(VersionedProcessedMessage::unwrap_v1)
+            .collect();
+        Ok(VersionedUsedProcessedMessages::V1(
+            dkg_v1::UsedProcessedMessages(processed_messages),
+        ))
+    }
+
+    fn party_id(&self) -> FastCryptoResult<PartyId> {
+        match self {
+            DkgRole::Party(party) => Ok(party.id),
+            DkgRole::Observer(_) => Err(FastCryptoError::InvalidInput),
+        }
+    }
+
+    fn validate_party_output(
+        &self,
+        output: &Output<PkG, EncG>,
+        public_output: &Output<PkG, EncG>,
+    ) -> FastCryptoResult<()> {
+        let party_id = self.party_id()?;
+        if output.nodes != public_output.nodes || output.vss_pk != public_output.vss_pk {
+            return Err(FastCryptoError::InvalidInput);
+        }
+
+        let shares = output
+            .shares
+            .as_ref()
+            .filter(|shares| !shares.is_empty())
+            .ok_or(FastCryptoError::InvalidInput)?;
+        let expected_share_ids = output.nodes.share_ids_of(party_id)?;
+        if shares.iter().map(|share| share.index).collect::<Vec<_>>() != expected_share_ids {
+            return Err(FastCryptoError::InvalidInput);
+        }
+
+        const RECOVERY_PROOF_MESSAGE: &[u8] = b"sui-randomness-dkg-recovered-shares-v1";
+        for share in shares {
+            let partial = ThresholdBls12381MinSig::partial_sign(share, RECOVERY_PROOF_MESSAGE);
+            ThresholdBls12381MinSig::partial_verify(
+                &output.vss_pk,
+                RECOVERY_PROOF_MESSAGE,
+                &partial,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn dkg_transcript_digest(
+    used_messages: &VersionedUsedProcessedMessages,
+    confirmations: &[(PartyId, VersionedDkgConfirmation)],
+) -> FastCryptoResult<[u8; 32]> {
+    let used_messages_v1 = used_messages.as_v1().ok_or(FastCryptoError::InvalidInput)?;
+    let mut senders = std::collections::BTreeSet::new();
+    if used_messages_v1
+        .0
+        .iter()
+        .any(|message| !senders.insert(message.message.sender))
+        || confirmations.iter().any(|(sender, confirmation)| {
+            confirmation.as_v1().map(|value| value.sender) != Some(*sender)
+        })
+    {
+        return Err(FastCryptoError::InvalidInput);
+    }
+
+    let bytes = bcs::to_bytes(&(used_messages, confirmations))
+        .map_err(|_| FastCryptoError::InvalidInput)?;
+    Ok(Blake2b256::digest(&bytes).into())
 }
 
 // State machine for randomness DKG and generation.
@@ -316,6 +467,7 @@ pub struct RandomnessManager {
     used_messages: OnceCell<VersionedUsedProcessedMessages>,
     confirmations: BTreeMap<PartyId, VersionedDkgConfirmation>,
     dkg_output: OnceCell<Option<dkg_v1::Output<PkG, EncG>>>,
+    local_participation: LocalRandomnessParticipation,
 
     // State for randomness generation.
     next_randomness_round: RandomnessRound,
@@ -357,6 +509,15 @@ impl RandomnessManager {
             .metrics
             .epoch_random_beacon_dkg_num_shares
             .set(0);
+        epoch_store
+            .metrics
+            .epoch_random_beacon_local_shares_ready
+            .set(0);
+        epoch_store
+            .metrics
+            .epoch_random_beacon_recovered_shares
+            .set(0);
+        epoch_store.metrics.epoch_random_beacon_signer_ready.set(0);
 
         let committee = epoch_store.committee();
         let info = RandomnessManager::randomness_dkg_info_from_committee(committee);
@@ -422,6 +583,19 @@ impl RandomnessManager {
             t,
             random_oracle,
         )?);
+        if let Ok(party_id) = role.party_id() {
+            let expected_party_id: PartyId = committee
+                .authority_index(&epoch_store.name)?
+                .try_into()
+                .ok()?;
+            if party_id != expected_party_id {
+                error!(
+                    "random beacon: protocol key resolves to DKG party {party_id}, but local authority {} is party {expected_party_id}",
+                    epoch_store.name
+                );
+                return None;
+            }
+        }
 
         // Load existing data from store.
         let highest_completed_round = tables
@@ -435,12 +609,17 @@ impl RandomnessManager {
             network_handle: network_handle.clone(),
             authority_info,
             dkg_start_time: OnceCell::new(),
-            role,
+            role: role.clone(),
             enqueued_messages: BTreeMap::new(),
             processed_messages: BTreeMap::new(),
             used_messages: OnceCell::new(),
             confirmations: BTreeMap::new(),
             dkg_output: OnceCell::new(),
+            local_participation: if role.is_observer() {
+                LocalRandomnessParticipation::Observer
+            } else {
+                LocalRandomnessParticipation::Pending
+            },
             next_randomness_round: RandomnessRound(0),
             highest_completed_round: Arc::new(Mutex::new(highest_completed_round)),
             randomness_receiver_handle,
@@ -450,7 +629,83 @@ impl RandomnessManager {
             .get(&SINGLETON_KEY)
             .expect("typed_store should not fail");
         match dkg_output {
-            Some(Some(dkg_output)) => {
+            Some(Some(mut dkg_output)) => {
+                if rm.role.is_party() && dkg_output.shares.is_none() {
+                    let used_messages = tables
+                        .dkg_used_messages_v2
+                        .get(&SINGLETON_KEY)
+                        .expect("typed_store should not fail")?;
+                    let confirmations = tables
+                        .dkg_confirmations_v2
+                        .safe_iter()
+                        .map(|result| result.expect("typed_store should not fail"))
+                        .collect::<Vec<_>>();
+                    let transcript_digest =
+                        dkg_transcript_digest(&used_messages, &confirmations).ok()?;
+                    let recovered_record = tables
+                        .dkg_recovered_output_v1
+                        .get(&SINGLETON_KEY)
+                        .expect("typed_store should not fail");
+                    let recovered_output = if let Some(recovered_record) = recovered_record {
+                        let recovered_record = recovered_record.into_v1();
+                        if recovered_record.epoch != committee.epoch()
+                            || recovered_record.dkg_version != protocol_config.dkg_version()
+                            || recovered_record.authority != epoch_store.name
+                            || recovered_record.party_id != rm.role.party_id().ok()?
+                            || recovered_record.transcript_digest != transcript_digest
+                        {
+                            error!(
+                                "random beacon: recovered private DKG overlay does not match local epoch, authority, or transcript"
+                            );
+                            return None;
+                        }
+                        recovered_record.output
+                    } else {
+                        let confirmation_values = confirmations
+                            .iter()
+                            .map(|(_, confirmation)| confirmation.clone())
+                            .collect::<Vec<_>>();
+                        let recovered_output = rm
+                            .role
+                            .recover_party_output(&used_messages, &confirmation_values)
+                            .ok()?;
+                        rm.role
+                            .validate_party_output(&recovered_output, &dkg_output)
+                            .ok()?;
+                        let recovered_record =
+                            VersionedRecoveredDkgOutput::V1(RecoveredDkgOutputV1 {
+                                epoch: committee.epoch(),
+                                dkg_version: protocol_config.dkg_version(),
+                                authority: epoch_store.name,
+                                party_id: rm.role.party_id().ok()?,
+                                transcript_digest,
+                                output: recovered_output.clone(),
+                            });
+                        tables
+                            .dkg_recovered_output_v1
+                            .insert(&SINGLETON_KEY, &recovered_record)
+                            .ok()?;
+                        recovered_output
+                    };
+                    if let Err(error) = rm
+                        .role
+                        .validate_party_output(&recovered_output, &dkg_output)
+                    {
+                        error!(
+                            "random beacon: recovered private DKG output failed validation: {error:?}"
+                        );
+                        return None;
+                    }
+                    dkg_output = recovered_output;
+                    rm.local_participation = LocalRandomnessParticipation::RecoveredShares;
+                } else if rm.role.is_party() && dkg_output.shares.is_some() {
+                    rm.role
+                        .validate_party_output(&dkg_output, &dkg_output)
+                        .ok()?;
+                    rm.local_participation = LocalRandomnessParticipation::NativeShares;
+                } else if rm.role.is_party() {
+                    rm.local_participation = LocalRandomnessParticipation::MissingShares;
+                }
                 info!(
                     "random beacon: loaded existing DKG output for epoch {}",
                     committee.epoch()
@@ -467,7 +722,9 @@ impl RandomnessManager {
                 rm.randomness_receiver_handle
                     .set_public_key(dkg_output.vss_pk.c0());
 
-                if let DkgRole::Party(party) = rm.role.as_ref() {
+                if let DkgRole::Party(party) = rm.role.as_ref()
+                    && rm.local_participation.can_sign()
+                {
                     network_handle.update_epoch(
                         committee.epoch(),
                         rm.authority_info.clone(),
@@ -475,6 +732,7 @@ impl RandomnessManager {
                         party.t(),
                         highest_completed_round,
                     );
+                    epoch_store.metrics.epoch_random_beacon_signer_ready.set(1);
                 }
             }
             Some(None) => {
@@ -501,19 +759,37 @@ impl RandomnessManager {
                     epoch_store.protocol_config().dkg_version() > 0,
                     "BUG: DKG version 0 is deprecated"
                 );
-                rm.processed_messages.extend(
-                    tables
-                        .dkg_processed_messages_v2
-                        .safe_iter()
-                        .map(|result| result.expect("typed_store should not fail")),
-                );
+                let persisted_processed_messages = tables
+                    .dkg_processed_messages_v2
+                    .safe_iter()
+                    .map(|result| result.expect("typed_store should not fail"))
+                    .collect::<Vec<_>>();
+                if rm.role.is_party() {
+                    for (sender, message) in persisted_processed_messages {
+                        if sender != message.sender() {
+                            error!(
+                                "random beacon: persisted DKG processed-message key does not match sender"
+                            );
+                            return None;
+                        }
+                        let message = rm.role.reprocess_party_message(&message).ok()?;
+                        rm.processed_messages.insert(sender, message);
+                    }
+                } else {
+                    rm.processed_messages.extend(persisted_processed_messages);
+                }
                 if let Some(used_messages) = tables
                     .dkg_used_messages_v2
                     .get(&SINGLETON_KEY)
                     .expect("typed_store should not fail")
                 {
+                    let used_messages = if rm.role.is_party() {
+                        rm.role.reprocess_party_used_messages(&used_messages).ok()?
+                    } else {
+                        used_messages
+                    };
                     rm.used_messages
-                        .set(used_messages.clone())
+                        .set(used_messages)
                         .expect("setting new OnceCell should succeed");
                 }
                 rm.confirmations.extend(
@@ -524,6 +800,15 @@ impl RandomnessManager {
                 );
             }
         }
+
+        epoch_store
+            .metrics
+            .epoch_random_beacon_local_shares_ready
+            .set(rm.local_participation.can_sign() as i64);
+        epoch_store
+            .metrics
+            .epoch_random_beacon_recovered_shares
+            .set((rm.local_participation == LocalRandomnessParticipation::RecoveredShares) as i64);
 
         // Resume randomness generation from where we left off.
         // This must be loaded regardless of whether DKG has finished yet, since the
@@ -540,7 +825,7 @@ impl RandomnessManager {
         );
 
         // Re-send partial signatures for incomplete rounds (validators only).
-        if rm.role.is_party() {
+        if rm.local_participation.can_sign() {
             let first_incomplete_round = highest_completed_round
                 .map(|r| r + 1)
                 .unwrap_or(RandomnessRound(0));
@@ -572,6 +857,13 @@ impl RandomnessManager {
 
         if self.used_messages.initialized() || self.dkg_output.initialized() {
             // DKG already started (or completed or failed).
+            return Ok(());
+        }
+
+        if self.processed_messages.contains_key(&party.id) {
+            info!(
+                "random beacon: local DKG dealer message is already present in the persisted transcript"
+            );
             return Ok(());
         }
 
@@ -781,6 +1073,11 @@ impl RandomnessManager {
                         DkgRole::Party(party) => {
                             let num_shares =
                                 output.shares.as_ref().map_or(0, |shares| shares.len());
+                            self.local_participation = if output.shares.is_some() {
+                                LocalRandomnessParticipation::NativeShares
+                            } else {
+                                LocalRandomnessParticipation::MissingShares
+                            };
                             let elapsed =
                                 self.dkg_start_time.get().map(|t| t.elapsed().as_millis());
                             info!(
@@ -792,6 +1089,14 @@ impl RandomnessManager {
                                 .metrics
                                 .epoch_random_beacon_dkg_num_shares
                                 .set(num_shares as i64);
+                            epoch_store
+                                .metrics
+                                .epoch_random_beacon_local_shares_ready
+                                .set(self.local_participation.can_sign() as i64);
+                            epoch_store
+                                .metrics
+                                .epoch_random_beacon_recovered_shares
+                                .set(0);
 
                             if let Some(elapsed) = elapsed {
                                 epoch_store
@@ -800,13 +1105,16 @@ impl RandomnessManager {
                                     .set(elapsed as i64);
                             }
 
-                            self.network_handle.update_epoch(
-                                epoch_store.committee().epoch(),
-                                self.authority_info.clone(),
-                                output,
-                                party.t(),
-                                None,
-                            );
+                            if self.local_participation.can_sign() {
+                                self.network_handle.update_epoch(
+                                    epoch_store.committee().epoch(),
+                                    self.authority_info.clone(),
+                                    output,
+                                    party.t(),
+                                    None,
+                                );
+                                epoch_store.metrics.epoch_random_beacon_signer_ready.set(1);
+                            }
                         }
                         DkgRole::Observer(_) => {
                             info!(
@@ -951,7 +1259,7 @@ impl RandomnessManager {
 
     /// Starts the process of generating the given RandomnessRound (validators only).
     pub fn generate_randomness(&self, epoch: EpochId, randomness_round: RandomnessRound) {
-        if self.role.is_party() {
+        if self.local_participation.can_sign() {
             self.network_handle
                 .send_partial_signatures(epoch, randomness_round);
         }
@@ -963,6 +1271,10 @@ impl RandomnessManager {
             Some(None) => DkgStatus::Failed,
             None => DkgStatus::Pending,
         }
+    }
+
+    pub fn local_randomness_participation(&self) -> LocalRandomnessParticipation {
+        self.local_participation
     }
 
     /// Generates a new RandomnessReporter for reporting observed rounds to this RandomnessManager.
@@ -1063,6 +1375,21 @@ pub enum DkgStatus {
     Pending,
     Failed,
     Successful,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRandomnessParticipation {
+    Observer,
+    Pending,
+    NativeShares,
+    RecoveredShares,
+    MissingShares,
+}
+
+impl LocalRandomnessParticipation {
+    pub fn can_sign(self) -> bool {
+        matches!(self, Self::NativeShares | Self::RecoveredShares)
+    }
 }
 
 #[cfg(test)]
@@ -1503,6 +1830,211 @@ mod tests {
             let output = rm.dkg_output().expect("validator should have DKG output");
             assert!(output.shares.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_observer_output_recovers_party_shares() {
+        telemetry_subscribers::init_for_testing();
+
+        let mut setup = DkgTestSetup::new(true).await;
+        let dkg_messages = setup.start_dkg_and_collect_messages().await;
+        setup
+            .distribute_messages_and_advance(&dkg_messages, 0)
+            .await;
+        setup.collect_and_distribute_confirmations().await;
+
+        let expected_validator_shares = setup.randomness_managers[0]
+            .dkg_output()
+            .unwrap()
+            .shares
+            .clone()
+            .unwrap();
+
+        let persisted_observer_output = setup.epoch_stores[0]
+            .tables()
+            .unwrap()
+            .dkg_output_v2
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .flatten()
+            .unwrap();
+        assert!(persisted_observer_output.shares.is_none());
+
+        let wrong_key_recovery = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[1].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await;
+        assert!(wrong_key_recovery.is_none());
+        assert!(
+            setup.epoch_stores[0]
+                .tables()
+                .unwrap()
+                .dkg_recovered_output_v1
+                .get(&SINGLETON_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        let recovered = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        let recovered_output = recovered.dkg_output().unwrap();
+        assert_eq!(
+            LocalRandomnessParticipation::RecoveredShares,
+            recovered.local_randomness_participation()
+        );
+        assert!(recovered.local_randomness_participation().can_sign());
+        assert_eq!(
+            expected_validator_shares,
+            recovered_output.shares.clone().unwrap()
+        );
+        assert_eq!(persisted_observer_output.nodes, recovered_output.nodes);
+        assert_eq!(persisted_observer_output.vss_pk, recovered_output.vss_pk);
+
+        let tables = setup.epoch_stores[0].tables().unwrap();
+        let persisted_public_output = tables
+            .dkg_output_v2
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .flatten()
+            .unwrap();
+        assert!(persisted_public_output.shares.is_none());
+        let overlay_before_restart = tables
+            .dkg_recovered_output_v1
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .expect("recovered shares should be persisted separately");
+        let overlay_before_restart = bcs::to_bytes(&overlay_before_restart).unwrap();
+
+        let recovered_again = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            LocalRandomnessParticipation::RecoveredShares,
+            recovered_again.local_randomness_participation()
+        );
+        assert_eq!(
+            overlay_before_restart,
+            bcs::to_bytes(
+                &tables
+                    .dkg_recovered_output_v1
+                    .get(&SINGLETON_KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+
+        let mut tampered_overlay = tables
+            .dkg_recovered_output_v1
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .unwrap()
+            .into_v1();
+        tampered_overlay.transcript_digest[0] ^= 1;
+        tables
+            .dkg_recovered_output_v1
+            .insert(
+                &SINGLETON_KEY,
+                &VersionedRecoveredDkgOutput::V1(tampered_overlay),
+            )
+            .unwrap();
+        let tampered_recovery = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await;
+        assert!(tampered_recovery.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_observer_intermediate_state_is_reprocessed_on_promotion() {
+        telemetry_subscribers::init_for_testing();
+
+        let mut setup = DkgTestSetup::new(true).await;
+        let dkg_messages = setup.start_dkg_and_collect_messages().await;
+        setup
+            .distribute_messages_and_advance(&dkg_messages, 0)
+            .await;
+
+        let persisted_used_messages = setup.epoch_stores[0]
+            .tables()
+            .unwrap()
+            .dkg_used_messages_v2
+            .get(&SINGLETON_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(
+            persisted_used_messages
+                .as_v1()
+                .unwrap()
+                .0
+                .iter()
+                .all(|message| message.shares.is_empty())
+        );
+
+        let promoted = RandomnessManager::try_new(
+            Arc::downgrade(&setup.epoch_stores[0]),
+            Box::new(setup.consensus_adapter(setup.epoch_stores[0].name)),
+            sui_network::randomness::Handle::new_stub(),
+            Some(setup.network_config.validator_configs[0].protocol_key_pair()),
+            RandomnessRoundReceiverHandle::new_for_testing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            LocalRandomnessParticipation::Pending,
+            promoted.local_randomness_participation()
+        );
+        assert!(!promoted.local_randomness_participation().can_sign());
+        let promoted_used_messages = promoted.used_messages.get().unwrap();
+        assert!(
+            promoted_used_messages
+                .as_v1()
+                .unwrap()
+                .0
+                .iter()
+                .all(|message| !message.shares.is_empty())
+        );
+        assert_eq!(
+            setup.randomness_managers[0].used_messages.get().unwrap(),
+            promoted_used_messages
+        );
+
+        setup.epoch_stores[0]
+            .record_randomness_round_in_checkpoint(RandomnessRound(7))
+            .unwrap();
+        setup.epoch_stores[0]
+            .record_randomness_round_in_checkpoint(RandomnessRound(3))
+            .unwrap();
+        assert_eq!(
+            Some(RandomnessRound(7)),
+            setup.epoch_stores[0]
+                .tables()
+                .unwrap()
+                .randomness_highest_completed_round
+                .get(&SINGLETON_KEY)
+                .unwrap()
+        );
     }
 
     /// Builds a minimal set of DKG Nodes from a network config's validator key pairs.

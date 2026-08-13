@@ -31,6 +31,8 @@ impl Metrics {
         if let Some(inner) = &self.0 {
             inner.current_epoch.set(epoch as i64);
             inner.highest_round_generated.set(-1);
+            inner.highest_round_partial_signed.set(-1);
+            inner.partial_signature_batches_generated.set(0);
             inner.num_ignored_byzantine_peers.set(0);
         }
     }
@@ -46,6 +48,15 @@ impl Metrics {
     pub fn set_num_rounds_pending(&self, num_rounds_pending: i64) {
         if let Some(inner) = &self.0 {
             inner.num_rounds_pending.set(num_rounds_pending);
+        }
+    }
+
+    pub fn record_partial_signatures(&self, round: RandomnessRound) {
+        if let Some(inner) = &self.0 {
+            inner
+                .highest_round_partial_signed
+                .set(inner.highest_round_partial_signed.get().max(round.0 as i64));
+            inner.partial_signature_batches_generated.inc();
         }
     }
 
@@ -73,6 +84,8 @@ impl Metrics {
 struct Inner {
     current_epoch: IntGauge,
     highest_round_generated: IntGauge,
+    highest_round_partial_signed: IntGauge,
+    partial_signature_batches_generated: IntGauge,
     num_rounds_pending: IntGauge,
     round_generation_latency: Histogram,
     round_observation_latency: Histogram,
@@ -96,6 +109,16 @@ impl Inner {
             highest_round_generated: register_int_gauge_with_registry!(
                 "randomness_highest_round_generated",
                 "The highest round for which randomness has been generated for the current epoch",
+                registry
+            ).unwrap(),
+            highest_round_partial_signed: register_int_gauge_with_registry!(
+                "randomness_highest_round_partial_signed",
+                "The highest round for which this node generated local randomness partial signatures in the current epoch",
+                registry
+            ).unwrap(),
+            partial_signature_batches_generated: register_int_gauge_with_registry!(
+                "randomness_partial_signature_batches_generated",
+                "The number of local randomness partial-signature batches generated in the current epoch",
                 registry
             ).unwrap(),
             num_rounds_pending: register_int_gauge_with_registry!(

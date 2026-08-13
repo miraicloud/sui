@@ -467,20 +467,24 @@ impl CheckpointExecutor {
 
         finish_stage!(pipeline_handle, CommitTransactionOutputs);
 
-        self.epoch_store
-            .handle_finalized_checkpoint(&ckpt_state.data.checkpoint, &ckpt_state.data.tx_digests)
-            .expect("cannot fail");
-
         let randomness_rounds = self.extract_randomness_rounds(
             &ckpt_state.data.checkpoint,
             &ckpt_state.data.checkpoint_contents,
         );
 
+        self.epoch_store
+            .handle_finalized_checkpoint(&ckpt_state.data.checkpoint, &ckpt_state.data.tx_digests)
+            .expect("cannot fail");
+
         // Once the checkpoint is finalized, we know that any randomness contained in this checkpoint has
         // been successfully included in a checkpoint certified by quorum of validators.
-        // (RandomnessManager/RandomnessReporter is only present on validators.)
-        if let Some(randomness_reporter) = self.epoch_store.randomness_reporter() {
-            for round in randomness_rounds {
+        // Persist the watermark for observers as well as validators so promotion cannot replay
+        // historical rounds. Only validators have a reporter and randomness network to notify.
+        for round in randomness_rounds {
+            self.epoch_store
+                .record_randomness_round_in_checkpoint(round)
+                .expect("epoch cannot have ended");
+            if let Some(randomness_reporter) = self.epoch_store.randomness_reporter() {
                 debug!(
                     ?round,
                     "notifying RandomnessReporter that randomness update was executed in checkpoint"

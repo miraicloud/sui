@@ -114,7 +114,7 @@ use crate::consensus_handler::{
 use crate::epoch::epoch_metrics::EpochMetrics;
 use crate::epoch::randomness::{
     RandomnessManager, RandomnessReporter, SINGLETON_KEY, VersionedProcessedMessage,
-    VersionedUsedProcessedMessages,
+    VersionedRecoveredDkgOutput, VersionedUsedProcessedMessages,
 };
 use crate::epoch::reconfiguration::ReconfigState;
 use crate::execution_cache::ObjectCacheRead;
@@ -523,6 +523,10 @@ pub struct AuthorityEpochTables {
     /// Records confirmations received from other nodes. Updated when receiving a new
     /// dkg::Confirmation via consensus.
     pub(crate) dkg_confirmations_v2: DBMap<PartyId, VersionedDkgConfirmation>,
+    /// Holds private DKG shares reconstructed locally after an observer is promoted to a
+    /// validator. This table is not written by consensus replay and must never replace
+    /// `dkg_output_v2`.
+    pub(crate) dkg_recovered_output_v1: DBMap<u64, VersionedRecoveredDkgOutput>,
     /// Holds the value of the next RandomnessRound to be generated.
     pub(crate) randomness_next_round: DBMap<u64, RandomnessRound>,
     /// Holds the value of the highest completed RandomnessRound (as reported to RandomnessReporter).
@@ -725,6 +729,10 @@ impl AuthorityEpochTables {
             (
                 "dkg_confirmations_v2".to_string(),
                 ThConfig::new(2, 1, KeyType::uniform(1)),
+            ),
+            (
+                "dkg_recovered_output_v1".to_string(),
+                ThConfig::new(8, 1, KeyType::uniform(1)),
             ),
             (
                 "randomness_next_round".to_string(),
@@ -1104,6 +1112,25 @@ impl AuthorityPerEpochStore {
 
     pub fn randomness_reporter(&self) -> Option<RandomnessReporter> {
         self.randomness_reporter.get().cloned()
+    }
+
+    /// Persists the highest randomness round observed in a finalized checkpoint for every node
+    /// role. In particular, consensus observers need this watermark before promotion so they do
+    /// not replay already-completed rounds from zero.
+    pub(crate) fn record_randomness_round_in_checkpoint(
+        &self,
+        round: RandomnessRound,
+    ) -> SuiResult {
+        let tables = self.tables()?;
+        let current = tables
+            .randomness_highest_completed_round
+            .get(&SINGLETON_KEY)?;
+        if current.is_none_or(|current| round > current) {
+            tables
+                .randomness_highest_completed_round
+                .insert(&SINGLETON_KEY, &round)?;
+        }
+        Ok(())
     }
 
     pub async fn set_randomness_manager(
