@@ -24,6 +24,7 @@ pub trait EpochStartSystemStateTrait {
     fn epoch_start_timestamp_ms(&self) -> u64;
     fn epoch_duration_ms(&self) -> u64;
     fn get_validator_addresses(&self) -> Vec<SuiAddress>;
+    fn get_validator_by_address(&self, address: SuiAddress) -> Option<EpochStartValidatorInfoV1>;
     fn get_sui_committee(&self) -> Committee;
     fn get_sui_committee_with_network_metadata(&self) -> CommitteeWithNetworkMetadata;
     fn get_consensus_committee(&self) -> ConsensusCommittee;
@@ -146,6 +147,13 @@ impl EpochStartSystemStateTrait for EpochStartSystemStateV1 {
             .iter()
             .map(|validator| validator.sui_address)
             .collect()
+    }
+
+    fn get_validator_by_address(&self, address: SuiAddress) -> Option<EpochStartValidatorInfoV1> {
+        self.active_validators
+            .iter()
+            .find(|validator| validator.sui_address == address)
+            .cloned()
     }
 
     fn get_sui_committee_with_network_metadata(&self) -> CommitteeWithNetworkMetadata {

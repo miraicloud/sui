@@ -10,6 +10,7 @@ use anemo_tower::trace::TraceLayer;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::{bail, ensure};
 use arc_swap::ArcSwap;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
@@ -42,7 +43,7 @@ use sui_core::randomness_round_receiver::{RandomnessRoundReceiver, RandomnessRou
 use sui_network::endpoint_manager::{AddressSource, EndpointId};
 use sui_network::validator::server::SUI_TLS_SERVER_NAME;
 use sui_types::full_checkpoint_content::Checkpoint;
-use sui_types::node_role::NodeRole;
+use sui_types::node_role::{FullNodeSyncMode, NodeRole};
 
 use sui_core::global_state_hasher::GlobalStateHashMetrics;
 use sui_core::storage::RestReadStore;
@@ -166,6 +167,8 @@ mod handle;
 pub mod metrics;
 pub mod promotion;
 
+use promotion::{ValidatorPromotionGuard, ValidatorPromotionPhase};
+
 pub struct ValidatorComponents {
     validator_server_handle: Option<SpawnOnce>,
     validator_overload_monitor_handle: Option<JoinHandle<()>>,
@@ -257,6 +260,7 @@ const DEFAULT_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct SuiNode {
     config: NodeConfig,
     validator_components: Mutex<Option<ValidatorComponents>>,
+    validator_promotion_guard: Mutex<Option<ValidatorPromotionGuard>>,
 
     /// The http servers responsible for serving RPC traffic (gRPC and JSON-RPC)
     #[allow(unused)]
@@ -293,7 +297,7 @@ pub struct SuiNode {
 
     _state_snapshot_uploader_handle: Option<broadcast::Sender<()>>,
     // Channel to allow signaling upstream to shutdown sui-node
-    shutdown_channel_tx: broadcast::Sender<Option<RunWithRange>>,
+    shutdown_channel_tx: broadcast::Sender<SuiNodeShutdownReason>,
 
     /// Handle shared with RandomnessManager and the consensus layer.
     randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
@@ -311,6 +315,16 @@ pub struct SuiNode {
     /// indexer keeps running (dropping it aborts the indexer). Exposed
     /// through [`SuiNode::embedded_rpc_store`] for introspection.
     embedded_rpc_store: Option<EmbeddedRpcStore>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SuiNodeShutdownReason {
+    RunWithRange(Option<RunWithRange>),
+    RoleTransition {
+        epoch: EpochId,
+        previous_role: NodeRole,
+        new_role: NodeRole,
+    },
 }
 
 impl fmt::Debug for SuiNode {
@@ -480,6 +494,7 @@ impl SuiNode {
         if let Some(prober_config) = &config.address_prober {
             prober_config.validate()?;
         }
+        config.validator_role_transition.validate()?;
 
         let mut config = config.clone();
         if config.supported_protocol_versions.is_none() {
@@ -492,10 +507,10 @@ impl SuiNode {
 
         let run_with_range = config.run_with_range;
         let prometheus_registry = registry_service.default_registry();
-        let node_role = config.intended_node_role();
+        let intended_node_role = config.intended_node_role();
 
         info!(node =? config.protocol_public_key(),
-            "Initializing sui-node listening on {} with role {:?}", config.network_address, node_role
+            "Initializing sui-node listening on {} with intended role {:?}", config.network_address, intended_node_role
         );
 
         // Initialize metrics to track db usage before creating any stores
@@ -541,7 +556,7 @@ impl SuiNode {
         // under the same binary version that produced it.
         checkpoint_store.set_binary_version(&build_version);
 
-        if node_role.runs_consensus() {
+        if intended_node_role.runs_consensus() {
             Self::check_and_recover_forks(
                 &checkpoint_store,
                 &checkpoint_metrics,
@@ -554,14 +569,18 @@ impl SuiNode {
         // By default, only enable write stall on nodes that run consensus.
         let enable_write_stall = config
             .enable_db_write_stall
-            .unwrap_or(node_role.runs_consensus());
+            .unwrap_or(intended_node_role.runs_consensus());
         // The tidehunter objects compactor retains only the latest version per
         // ObjectID and is mutually exclusive with the object pruner. Enable it
         // for validators (which always disable the pruner), and also for any
         // node configured with `num_epochs_to_retain = 0` — that aggressive
         // setting is what the compactor replaces. The pruner is force-disabled
         // in `AuthorityStorePruner::new` whenever this is true.
-        let enable_objects_compactor = node_role.is_validator()
+        let enable_objects_compactor = intended_node_role.is_validator()
+            || config
+                .validator_role_transition
+                .promotion_manifest_path
+                .is_some()
             || config.authority_store_pruning_config.num_epochs_to_retain == 0;
         let perpetual_tables_options = AuthorityPerpetualTablesOptions {
             enable_write_stall,
@@ -651,6 +670,15 @@ impl SuiNode {
             )),
             config.fullnode_sync_mode,
         )?;
+
+        let node_role = epoch_store.node_role();
+        if node_role != intended_node_role {
+            info!(
+                ?intended_node_role,
+                ?node_role,
+                "Committee-derived startup role differs from configured role"
+            );
+        }
 
         info!("created epoch store");
 
@@ -859,6 +887,71 @@ impl SuiNode {
                 .unwrap();
         }
 
+        let mut validator_promotion_guard = match (
+            &config.validator_role_transition.promotion_manifest_path,
+            &config.validator_role_transition.promotion_state_path,
+        ) {
+            (Some(manifest_path), Some(state_path)) => Some(ValidatorPromotionGuard::load(
+                manifest_path,
+                state_path.clone(),
+                chain_identifier,
+                &config,
+            )?),
+            (None, None) => None,
+            _ => unreachable!("validator role transition config was validated"),
+        };
+
+        if node_role.is_validator()
+            && matches!(
+                config.fullnode_sync_mode,
+                Some(FullNodeSyncMode::ConsensusObserver)
+            )
+        {
+            let guard = validator_promotion_guard.as_mut().context(
+                "consensus observer cannot start as a validator without a promotion manifest",
+            )?;
+            let validator = epoch_store
+                .epoch_start_state()
+                .get_validator_by_address(guard.manifest().validator_address)
+                .context("promotion validator address is absent from the current committee")?;
+            guard.activate(epoch_store.epoch(), &validator, &state, &checkpoint_store)?;
+            info!(
+                plan_id = %guard.manifest().plan_id,
+                epoch = epoch_store.epoch(),
+                "Authorized validator startup from finalized promotion manifest"
+            );
+        } else if let Some(guard) = validator_promotion_guard.as_mut() {
+            match guard.state().phase() {
+                ValidatorPromotionPhase::Prepared => {
+                    ensure!(
+                        epoch_store.epoch() == guard.manifest().source_epoch,
+                        "prepared promotion manifest is stale or not yet executable"
+                    );
+                    let validator = epoch_store
+                        .epoch_start_state()
+                        .get_validator_by_address(guard.manifest().validator_address)
+                        .context(
+                            "promotion source validator is absent from the current committee",
+                        )?;
+                    guard.manifest().validate_source_validator(&validator)?;
+                }
+                ValidatorPromotionPhase::CommitteeObserved => {
+                    bail!(
+                        "promotion target committee was observed but the local target key is absent"
+                    )
+                }
+                ValidatorPromotionPhase::Active => {
+                    guard.retire(epoch_store.epoch())?;
+                    info!(
+                        plan_id = %guard.manifest().plan_id,
+                        epoch = epoch_store.epoch(),
+                        "Retired promotion plan because target key is absent from the committee"
+                    );
+                }
+                ValidatorPromotionPhase::Retired => {}
+            }
+        }
+
         // Start the loop that receives new randomness and generates transactions for it.
         // The returned is long-lived (node lifetime).
         let randomness_receiver_handle =
@@ -931,7 +1024,6 @@ impl SuiNode {
             .configured_max_protocol_version
             .set(config.supported_protocol_versions.unwrap().max.as_u64() as i64);
 
-        let node_role = epoch_store.node_role();
         let validator_components = if node_role.runs_consensus() {
             let mut components = Self::construct_validator_components(
                 config.clone(),
@@ -1004,11 +1096,12 @@ impl SuiNode {
         };
 
         // setup shutdown channel
-        let (shutdown_channel, _) = broadcast::channel::<Option<RunWithRange>>(1);
+        let (shutdown_channel, _) = broadcast::channel::<SuiNodeShutdownReason>(1);
 
         let node = Self {
             config,
             validator_components: Mutex::new(validator_components),
+            validator_promotion_guard: Mutex::new(validator_promotion_guard),
             http_servers,
             state,
             transaction_orchestrator,
@@ -1058,7 +1151,7 @@ impl SuiNode {
         self.end_of_epoch_channel.subscribe()
     }
 
-    pub fn subscribe_to_shutdown_channel(&self) -> broadcast::Receiver<Option<RunWithRange>> {
+    pub fn subscribe_to_shutdown_channel(&self) -> broadcast::Receiver<SuiNodeShutdownReason> {
         self.shutdown_channel_tx.subscribe()
     }
 
@@ -2005,7 +2098,7 @@ impl SuiNode {
             if stop_condition == StopReason::RunWithRangeCondition {
                 SuiNode::shutdown(&self).await;
                 self.shutdown_channel_tx
-                    .send(run_with_range)
+                    .send(SuiNodeShutdownReason::RunWithRange(run_with_range))
                     .expect("RunWithRangeCondition met but failed to send shutdown message");
                 return Ok(());
             }
@@ -2082,7 +2175,84 @@ impl SuiNode {
                 )
                 .await;
 
+            let previous_role = cur_epoch_store.node_role();
             let new_role = new_epoch_store.node_role();
+
+            if previous_role != new_role
+                && self.config.validator_role_transition.restart_on_role_change
+            {
+                let mut guard = self.validator_promotion_guard.lock().await;
+                let transition_result = (|| -> Result<()> {
+                    if new_role.is_validator()
+                        && matches!(
+                            self.config.fullnode_sync_mode,
+                            Some(FullNodeSyncMode::ConsensusObserver)
+                        )
+                    {
+                        let guard = guard.as_mut().context(
+                            "consensus observer cannot become a validator without a promotion manifest",
+                        )?;
+                        let validator = new_epoch_store
+                            .epoch_start_state()
+                            .get_validator_by_address(guard.manifest().validator_address)
+                            .context(
+                                "promotion validator address is absent from the new committee",
+                            )?;
+                        let source_validator = cur_epoch_store
+                            .epoch_start_state()
+                            .get_validator_by_address(guard.manifest().validator_address)
+                            .context(
+                                "promotion source validator is absent from the source committee",
+                            )?;
+                        guard
+                            .manifest()
+                            .validate_source_validator(&source_validator)?;
+                        guard.observe_target_committee(
+                            next_epoch,
+                            &validator,
+                            &self.state,
+                            &self.checkpoint_store,
+                        )?;
+                        info!(
+                            plan_id = %guard.manifest().plan_id,
+                            next_epoch,
+                            "Promotion committee observed; restarting before validator activation"
+                        );
+                    } else if previous_role.is_validator()
+                        && let Some(guard) = guard.as_mut()
+                    {
+                        guard.retire(next_epoch)?;
+                        info!(
+                            plan_id = %guard.manifest().plan_id,
+                            next_epoch,
+                            "Retired promotion plan during validator demotion"
+                        );
+                    }
+                    Ok(())
+                })();
+                drop(guard);
+
+                if let Some(components) = validator_components_lock_guard.as_ref() {
+                    components.consensus_manager.shutdown().await;
+                }
+                if let Err(error) = &transition_result {
+                    error!(
+                        ?previous_role,
+                        ?new_role,
+                        next_epoch,
+                        ?error,
+                        "Role transition authorization failed; exiting fail-closed"
+                    );
+                }
+                self.shutdown_channel_tx
+                    .send(SuiNodeShutdownReason::RoleTransition {
+                        epoch: next_epoch,
+                        previous_role,
+                        new_role,
+                    })
+                    .expect("role transition shutdown receiver must be present");
+                return transition_result;
+            }
 
             let new_validator_components = if let Some(ValidatorComponents {
                 validator_server_handle,

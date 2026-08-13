@@ -118,8 +118,6 @@ fn main() {
         config.network_address = listen_address;
     }
 
-    let is_validator = config.intended_node_role().is_validator();
-
     let admin_interface_port = config.admin_interface_port;
 
     // Run node in a separate runtime so that admin/monitoring functions continue to work
@@ -128,7 +126,8 @@ fn main() {
     let node_once_cell_clone = node_once_cell.clone();
 
     // let sui-node signal main to shutdown runtimes
-    let (runtime_shutdown_tx, runtime_shutdown_rx) = broadcast::channel::<()>(1);
+    let (runtime_shutdown_tx, runtime_shutdown_rx) =
+        broadcast::channel::<sui_node::SuiNodeShutdownReason>(1);
 
     let server_version = ServerVersion::new(env!("CARGO_BIN_NAME"), VERSION);
     runtimes.sui_node.spawn(async move {
@@ -150,8 +149,9 @@ fn main() {
         // when we get a shutdown signal from sui-node, forward it on to the runtime_shutdown_channel here in
         // main to signal runtimes to all shutdown.
         tokio::select! {
-           _ = shutdown_rx.recv() => {
-                runtime_shutdown_tx.send(()).expect("failed to forward shutdown signal from sui-node to sui-node main");
+           reason = shutdown_rx.recv() => {
+                let reason = reason.expect("sui-node shutdown channel closed unexpectedly");
+                runtime_shutdown_tx.send(reason).expect("failed to forward shutdown signal from sui-node to sui-node main");
             }
         }
         // TODO: Do we want to provide a way for the node to gracefully shutdown?
@@ -163,6 +163,7 @@ fn main() {
     let node_once_cell_clone = node_once_cell.clone();
     runtimes.metrics.spawn(async move {
         let node = node_once_cell_clone.get().await;
+        let is_validator = node.node_role().is_validator();
         let chain_identifier = node.state().get_chain_identifier().to_string();
         info!("Sui chain identifier: {chain_identifier}");
         prometheus_registry
@@ -183,6 +184,7 @@ fn main() {
     runtimes.metrics.spawn(async move {
         let node = node_once_cell.get().await;
         let state = node.state();
+        let is_validator = node.node_role().is_validator();
         loop {
             send_telemetry_event(state.clone(), is_validator).await;
             sleep(Duration::from_secs(3600)).await;
@@ -190,7 +192,7 @@ fn main() {
     });
 
     // wait for SIGINT on the main thread
-    tokio::runtime::Builder::new_current_thread()
+    let shutdown_reason = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
@@ -198,18 +200,31 @@ fn main() {
 
     // Drop and wait all runtimes on main thread
     drop(runtimes);
+
+    if matches!(
+        shutdown_reason,
+        Some(sui_node::SuiNodeShutdownReason::RoleTransition { .. })
+    ) {
+        // EX_TEMPFAIL asks ordinary service supervisors to restart even when configured with
+        // Restart=on-failure. The on-disk epoch state is already durable at this point.
+        std::process::exit(75);
+    }
 }
 
 #[cfg(not(unix))]
-async fn wait_termination(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+async fn wait_termination(
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<sui_node::SuiNodeShutdownReason>,
+) -> Option<sui_node::SuiNodeShutdownReason> {
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = shutdown_rx.recv() => {},
+        _ = tokio::signal::ctrl_c() => None,
+        reason = shutdown_rx.recv() => reason.ok(),
     }
 }
 
 #[cfg(unix)]
-async fn wait_termination(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+async fn wait_termination(
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<sui_node::SuiNodeShutdownReason>,
+) -> Option<sui_node::SuiNodeShutdownReason> {
     use futures::FutureExt;
     use tokio::signal::unix::*;
 
@@ -219,8 +234,8 @@ async fn wait_termination(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>)
     let shutdown_recv = shutdown_rx.recv().boxed();
 
     tokio::select! {
-        _ = sigint => {},
-        _ = sigterm_recv => {},
-        _ = shutdown_recv => {},
+        _ = sigint => None,
+        _ = sigterm_recv => None,
+        reason = shutdown_recv => reason.ok(),
     }
 }

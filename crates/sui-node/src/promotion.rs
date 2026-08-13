@@ -15,19 +15,27 @@ use fastcrypto::{
 };
 use mysten_network::Multiaddr;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
 use sui_config::NodeConfig;
+use sui_core::{authority::AuthorityState, checkpoints::CheckpointStore};
 use sui_types::{
+    SUI_SYSTEM_PACKAGE_ID,
     base_types::{EpochId, SuiAddress},
     crypto::{
         AuthorityPublicKey, AuthoritySignature, NetworkPublicKey, verify_proof_of_possession,
     },
     digests::{ChainIdentifier, TransactionDigest},
+    effects::TransactionEffectsAPI,
     sui_system_state::epoch_start_sui_system_state::EpochStartValidatorInfoV1,
+    transaction::{
+        Argument, CallArg, Command, TransactionData, TransactionDataAPI, TransactionExpiration,
+        TransactionKind,
+    },
 };
 
 const MANIFEST_VERSION: u64 = 1;
@@ -141,6 +149,10 @@ impl ValidatorPromotionState {
     fn retire(&mut self, epoch: EpochId) {
         self.phase = ValidatorPromotionPhase::Retired;
         self.observed_epoch = Some(epoch);
+    }
+
+    pub fn phase(&self) -> ValidatorPromotionPhase {
+        self.phase
     }
 }
 
@@ -259,6 +271,18 @@ impl ValidatorPromotionManifest {
         );
         Ok(())
     }
+
+    pub fn validate_source_validator(&self, validator: &EpochStartValidatorInfoV1) -> Result<()> {
+        ensure!(
+            validator.sui_address == self.validator_address,
+            "promotion source validator address mismatch"
+        );
+        ensure!(
+            validator.protocol_pubkey == parse_authority_key(&self.source_protocol_public_key)?,
+            "promotion source protocol key mismatch"
+        );
+        Ok(())
+    }
 }
 
 impl ValidatorPromotionTarget {
@@ -320,12 +344,15 @@ impl ValidatorPromotionGuard {
         &mut self,
         epoch: EpochId,
         validator: &EpochStartValidatorInfoV1,
+        authority_state: &AuthorityState,
+        checkpoint_store: &CheckpointStore,
     ) -> Result<()> {
         ensure!(
-            epoch >= self.manifest.activation_epoch,
-            "target protocol key appeared before the authorized activation epoch"
+            epoch == self.manifest.activation_epoch,
+            "target protocol key did not appear at the authorized activation epoch"
         );
         self.manifest.validate_target_validator(validator)?;
+        self.validate_evidence(authority_state, checkpoint_store)?;
         self.state.observe_target_committee(epoch)?;
         persist_state(&self.state_path, &self.state)
     }
@@ -334,12 +361,24 @@ impl ValidatorPromotionGuard {
         &mut self,
         epoch: EpochId,
         validator: &EpochStartValidatorInfoV1,
+        authority_state: &AuthorityState,
+        checkpoint_store: &CheckpointStore,
     ) -> Result<()> {
-        ensure!(
-            epoch >= self.manifest.activation_epoch,
-            "target protocol key appeared before the authorized activation epoch"
-        );
+        if self.state.phase() == ValidatorPromotionPhase::Active {
+            ensure!(
+                epoch >= self.manifest.activation_epoch,
+                "active promotion state predates its authorized activation epoch"
+            );
+        } else {
+            ensure!(
+                epoch == self.manifest.activation_epoch,
+                "fresh promotion activation must occur at the authorized activation epoch"
+            );
+        }
         self.manifest.validate_target_validator(validator)?;
+        if self.state.phase() != ValidatorPromotionPhase::Active {
+            self.validate_evidence(authority_state, checkpoint_store)?;
+        }
         self.state.activate(epoch)?;
         persist_state(&self.state_path, &self.state)
     }
@@ -348,7 +387,189 @@ impl ValidatorPromotionGuard {
         self.state.retire(epoch);
         persist_state(&self.state_path, &self.state)
     }
+
+    fn validate_evidence(
+        &self,
+        authority_state: &AuthorityState,
+        checkpoint_store: &CheckpointStore,
+    ) -> Result<()> {
+        let evidence = &self.manifest.evidence;
+        let checkpoint = checkpoint_store
+            .get_checkpoint_by_sequence_number(evidence.checkpoint_sequence_number)?
+            .context("promotion evidence checkpoint is not available locally")?;
+        ensure!(
+            checkpoint.epoch() == self.manifest.source_epoch,
+            "promotion evidence was not finalized in the source epoch"
+        );
+        let contents = checkpoint_store
+            .get_checkpoint_contents(&checkpoint.content_digest)?
+            .context("promotion evidence checkpoint contents are not available locally")?;
+        ensure!(
+            contents
+                .iter()
+                .any(|digests| digests.transaction == evidence.transaction_digest),
+            "promotion transaction is not in the claimed finalized checkpoint"
+        );
+        let highest_executed = checkpoint_store
+            .get_highest_executed_checkpoint_seq_number()?
+            .context("node has not executed any checkpoints")?;
+        ensure!(
+            highest_executed >= evidence.checkpoint_sequence_number,
+            "promotion evidence checkpoint has not been executed locally"
+        );
+
+        let transaction = authority_state
+            .get_transaction_cache_reader()
+            .get_transaction_block(&evidence.transaction_digest)
+            .context("promotion transaction body is not available locally")?;
+        validate_promotion_transaction(
+            transaction.data().transaction_data(),
+            &self.manifest,
+            authority_state.get_chain_identifier(),
+        )?;
+
+        let effects = authority_state
+            .get_transaction_cache_reader()
+            .multi_get_executed_effects(&[evidence.transaction_digest])
+            .pop()
+            .flatten()
+            .context("promotion transaction effects are not available locally")?;
+        ensure!(
+            effects.status().is_ok(),
+            "promotion transaction did not execute successfully"
+        );
+        Ok(())
+    }
 }
+
+fn validate_promotion_transaction(
+    transaction: &TransactionData,
+    manifest: &ValidatorPromotionManifest,
+    chain: ChainIdentifier,
+) -> Result<()> {
+    ensure!(
+        transaction.sender() == manifest.validator_address,
+        "promotion transaction was not sent by the validator account"
+    );
+    ensure!(
+        transaction.expiration()
+            == &TransactionExpiration::ValidDuring {
+                min_epoch: Some(manifest.source_epoch),
+                max_epoch: Some(manifest.source_epoch),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain,
+                nonce: match transaction.expiration() {
+                    TransactionExpiration::ValidDuring { nonce, .. } => *nonce,
+                    _ => 0,
+                },
+            },
+        "promotion transaction must be bound to the exact source epoch and chain"
+    );
+
+    let TransactionKind::ProgrammableTransaction(pt) = transaction.kind() else {
+        bail!("promotion transaction is not a programmable transaction");
+    };
+    ensure!(
+        pt.commands.len() == REQUIRED_PROMOTION_FUNCTIONS.len(),
+        "promotion transaction must contain exactly seven metadata calls"
+    );
+    let mut functions = BTreeSet::new();
+    for command in &pt.commands {
+        let Command::MoveCall(call) = command else {
+            bail!("promotion transaction contains a non-Move command");
+        };
+        ensure!(
+            call.package == SUI_SYSTEM_PACKAGE_ID
+                && call.module.as_str() == "sui_system"
+                && call.type_arguments.is_empty(),
+            "promotion transaction contains a call outside 0x3::sui_system"
+        );
+        ensure!(
+            functions.insert(call.function.as_str()),
+            "promotion transaction contains a duplicate metadata call"
+        );
+        let expected_pure = expected_pure_arguments(call.function.as_str(), manifest)?;
+        ensure!(
+            call.arguments.len() == expected_pure.len() + 1,
+            "promotion metadata call has an unexpected argument count"
+        );
+        ensure!(
+            resolve_input(pt, call.arguments[0])? == &CallArg::SUI_SYSTEM_MUT,
+            "promotion metadata call does not target the Sui system state object"
+        );
+        for (argument, expected) in call.arguments[1..].iter().zip(expected_pure) {
+            ensure!(
+                resolve_input(pt, *argument)? == &CallArg::Pure(expected),
+                "promotion metadata call argument does not match the manifest"
+            );
+        }
+    }
+    ensure!(
+        functions == REQUIRED_PROMOTION_FUNCTIONS.into_iter().collect(),
+        "promotion transaction does not contain the complete metadata rotation"
+    );
+    Ok(())
+}
+
+fn resolve_input(
+    pt: &sui_types::transaction::ProgrammableTransaction,
+    argument: Argument,
+) -> Result<&CallArg> {
+    let Argument::Input(index) = argument else {
+        bail!("promotion metadata calls may only use transaction inputs");
+    };
+    pt.inputs
+        .get(index as usize)
+        .context("promotion metadata call references a missing input")
+}
+
+fn expected_pure_arguments(
+    function: &str,
+    manifest: &ValidatorPromotionManifest,
+) -> Result<Vec<Vec<u8>>> {
+    let target = &manifest.target;
+    let values = match function {
+        "update_validator_next_epoch_protocol_pubkey" => vec![
+            bcs::to_bytes(&parse_canonical_hex(&target.protocol_public_key)?)?,
+            bcs::to_bytes(&parse_canonical_hex(&manifest.proof_of_possession)?)?,
+        ],
+        "update_validator_next_epoch_network_pubkey" => {
+            vec![bcs::to_bytes(&parse_canonical_hex(
+                &target.network_public_key,
+            )?)?]
+        }
+        "update_validator_next_epoch_worker_pubkey" => {
+            vec![bcs::to_bytes(&parse_canonical_hex(
+                &target.worker_public_key,
+            )?)?]
+        }
+        "update_validator_next_epoch_network_address" => {
+            vec![bcs::to_bytes(&target.network_address)?]
+        }
+        "update_validator_next_epoch_p2p_address" => {
+            vec![bcs::to_bytes(&target.p2p_address)?]
+        }
+        "update_validator_next_epoch_primary_address" => {
+            vec![bcs::to_bytes(&target.primary_address)?]
+        }
+        "update_validator_next_epoch_worker_address" => {
+            vec![bcs::to_bytes(&target.worker_address)?]
+        }
+        _ => bail!("promotion transaction contains an unexpected metadata function"),
+    };
+    Ok(values)
+}
+
+const REQUIRED_PROMOTION_FUNCTIONS: [&str; 7] = [
+    "update_validator_next_epoch_protocol_pubkey",
+    "update_validator_next_epoch_network_pubkey",
+    "update_validator_next_epoch_worker_pubkey",
+    "update_validator_next_epoch_network_address",
+    "update_validator_next_epoch_p2p_address",
+    "update_validator_next_epoch_primary_address",
+    "update_validator_next_epoch_worker_address",
+];
 
 fn parse_canonical_hex(value: &str) -> Result<Vec<u8>> {
     ensure!(
@@ -426,6 +647,9 @@ mod tests {
     use sui_types::crypto::{
         AuthorityKeyPair, NetworkKeyPair, generate_proof_of_possession, get_key_pair,
     };
+    use sui_types::transaction::{
+        GasData, ProgrammableMoveCall, ProgrammableTransaction, TransactionDataV1,
+    };
 
     fn test_manifest() -> (
         ValidatorPromotionManifest,
@@ -499,6 +723,19 @@ mod tests {
         manifest.validate_static(chain, &config).unwrap();
         manifest.validate_target_validator(&validator).unwrap();
 
+        let mut source_validator = validator.clone();
+        source_validator.protocol_pubkey =
+            parse_authority_key(&manifest.source_protocol_public_key).unwrap();
+        manifest
+            .validate_source_validator(&source_validator)
+            .unwrap();
+        source_validator.protocol_pubkey = validator.protocol_pubkey.clone();
+        assert!(
+            manifest
+                .validate_source_validator(&source_validator)
+                .is_err()
+        );
+
         let mut wrong_validator = validator.clone();
         wrong_validator.narwhal_worker_address = "/dns/wrong.example/udp/8082".parse().unwrap();
         assert!(
@@ -523,5 +760,70 @@ mod tests {
 
         manifest.target.worker_address = "/dns/changed.example/udp/8082".parse().unwrap();
         assert!(state.validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn promotion_transaction_is_atomic_complete_and_exact_epoch_bound() {
+        let (manifest, _, _, chain) = test_manifest();
+        let mut inputs = vec![CallArg::SUI_SYSTEM_MUT];
+        let mut commands = Vec::new();
+        for function in REQUIRED_PROMOTION_FUNCTIONS {
+            let mut arguments = vec![Argument::Input(0)];
+            for value in expected_pure_arguments(function, &manifest).unwrap() {
+                let index = inputs.len();
+                inputs.push(CallArg::Pure(value));
+                arguments.push(Argument::Input(index as u16));
+            }
+            commands.push(Command::MoveCall(Box::new(ProgrammableMoveCall {
+                package: SUI_SYSTEM_PACKAGE_ID,
+                module: "sui_system".to_string(),
+                function: function.to_string(),
+                type_arguments: vec![],
+                arguments,
+            })));
+        }
+        let transaction = TransactionData::V1(TransactionDataV1 {
+            kind: TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
+                inputs,
+                commands,
+            }),
+            sender: manifest.validator_address,
+            gas_data: GasData {
+                payment: vec![],
+                owner: manifest.validator_address,
+                price: 1,
+                budget: 1,
+            },
+            expiration: TransactionExpiration::ValidDuring {
+                min_epoch: Some(manifest.source_epoch),
+                max_epoch: Some(manifest.source_epoch),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain,
+                nonce: 7,
+            },
+        });
+        validate_promotion_transaction(&transaction, &manifest, chain).unwrap();
+
+        let mut incomplete = transaction.clone();
+        let TransactionKind::ProgrammableTransaction(pt) = incomplete.kind_mut() else {
+            unreachable!();
+        };
+        pt.commands.pop();
+        assert!(validate_promotion_transaction(&incomplete, &manifest, chain).is_err());
+
+        let mut tampered = transaction.clone();
+        let TransactionKind::ProgrammableTransaction(pt) = tampered.kind_mut() else {
+            unreachable!();
+        };
+        let CallArg::Pure(value) = &mut pt.inputs[1] else {
+            unreachable!();
+        };
+        value.push(0);
+        assert!(validate_promotion_transaction(&tampered, &manifest, chain).is_err());
+
+        let mut loosely_expiring = transaction;
+        *loosely_expiring.expiration_mut() = TransactionExpiration::Epoch(manifest.source_epoch);
+        assert!(validate_promotion_transaction(&loosely_expiring, &manifest, chain).is_err());
     }
 }

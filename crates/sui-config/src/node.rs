@@ -2142,6 +2142,27 @@ remote-store-options:
         std::fs::remove_file(&aws_key_file).ok();
     }
 
+    mod validator_role_transition_tests {
+        use super::*;
+        use crate::node::ValidatorRoleTransitionConfig;
+
+        #[test]
+        fn promotion_paths_are_paired_and_require_restart() {
+            let mut config = ValidatorRoleTransitionConfig {
+                restart_on_role_change: false,
+                promotion_manifest_path: Some(PathBuf::from("/etc/sui/promotion.json")),
+                promotion_state_path: None,
+            };
+            assert!(config.validate().is_err());
+
+            config.promotion_state_path = Some(PathBuf::from("/var/lib/sui/promotion-state.json"));
+            assert!(config.validate().is_err());
+
+            config.restart_on_role_change = true;
+            config.validate().unwrap();
+        }
+    }
+
     mod intended_node_role_tests {
         use super::*;
         use crate::ConsensusConfig;
