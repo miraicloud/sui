@@ -8,7 +8,7 @@ use crate::p2p::P2pConfig;
 use crate::transaction_deny_config::{PeerDenySyncConfig, TransactionDenyConfig};
 use crate::validator_client_monitor_config::ValidatorClientMonitorConfig;
 use crate::verifier_signing_config::VerifierSigningConfig;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use consensus_config::Parameters as ConsensusParameters;
 use mysten_common::fatal;
 use nonzero_ext::nonzero;
@@ -90,6 +90,17 @@ pub struct NodeConfig {
     /// For validator nodes this is expected to be `None`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fullnode_sync_mode: Option<FullNodeSyncMode>,
+
+    /// Controls fail-closed process restarts across validator role changes.
+    ///
+    /// A promotion manifest never causes a role change. Committee membership remains the
+    /// authority for that decision; the manifest only constrains whether this process may start
+    /// validator components for the configured keys.
+    #[serde(
+        default,
+        skip_serializing_if = "ValidatorRoleTransitionConfig::is_disabled"
+    )]
+    pub validator_role_transition: ValidatorRoleTransitionConfig,
 
     #[serde(default = "default_enable_index_processing")]
     pub enable_index_processing: bool,
@@ -290,6 +301,47 @@ pub struct NodeConfig {
     /// Configuration for the trusted peer address prober.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address_prober: Option<AddressProberConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct ValidatorRoleTransitionConfig {
+    /// Exit after a committee-driven role change so the service supervisor reconstructs every
+    /// role-specific component from a clean process.
+    #[serde(default)]
+    pub restart_on_role_change: bool,
+
+    /// Root-managed, public promotion authorization. It contains public keys, addresses, and
+    /// finalized on-chain evidence, but no private key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_manifest_path: Option<PathBuf>,
+
+    /// Node-managed durable transition journal. This path must be writable by the sui-node
+    /// service identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_state_path: Option<PathBuf>,
+}
+
+impl ValidatorRoleTransitionConfig {
+    pub fn is_disabled(&self) -> bool {
+        !self.restart_on_role_change
+            && self.promotion_manifest_path.is_none()
+            && self.promotion_state_path.is_none()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.promotion_manifest_path.is_some() != self.promotion_state_path.is_some() {
+            bail!(
+                "validator role transition promotion-manifest-path and promotion-state-path must be configured together"
+            );
+        }
+        if self.promotion_manifest_path.is_some() && !self.restart_on_role_change {
+            bail!(
+                "validator role transition with a promotion manifest requires restart-on-role-change"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

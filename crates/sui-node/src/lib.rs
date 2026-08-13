@@ -164,6 +164,7 @@ pub mod admin;
 pub mod db_shell;
 mod handle;
 pub mod metrics;
+pub mod promotion;
 
 pub struct ValidatorComponents {
     validator_server_handle: Option<SpawnOnce>,
