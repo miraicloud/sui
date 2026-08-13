@@ -881,6 +881,7 @@ impl RandomnessEventLoop {
                     shares.iter(),
                     &round.signature_message(),
                 );
+                metrics.record_partial_signatures(round);
                 let full_sig_cell_clone = full_sig_cell.clone();
 
                 // Record own partial sigs.
