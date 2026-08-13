@@ -13,6 +13,7 @@ use fastcrypto::{
     encoding::{Encoding, Hex},
     traits::{KeyPair, ToFromBytes},
 };
+use mysten_common::ZipDebugEqIteratorExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::{
@@ -476,7 +477,7 @@ fn validate_promotion_transaction(
             resolve_input(pt, call.arguments[0])? == &CallArg::SUI_SYSTEM_MUT,
             "promotion metadata call does not target the Sui system state object"
         );
-        for (argument, expected) in call.arguments[1..].iter().zip(expected_pure) {
+        for (argument, expected) in call.arguments[1..].iter().zip_debug_eq(expected_pure) {
             ensure!(
                 resolve_input(pt, *argument)? == &CallArg::Pure(expected),
                 "promotion metadata call argument does not match the manifest"

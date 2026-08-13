@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use move_core_types::{ident_str, identifier::Identifier};
+use mysten_common::ZipDebugEqIteratorExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt::{self, Debug, Display, Formatter, Write},
@@ -1462,7 +1463,7 @@ fn validate_prepared_promotion_transaction(
             resolve_promotion_input(pt, call.arguments[0])? == &CallArg::SUI_SYSTEM_MUT,
             "promotion command does not target the Sui system state"
         );
-        for (argument, expected) in call.arguments[1..].iter().zip(expected) {
+        for (argument, expected) in call.arguments[1..].iter().zip_debug_eq(expected) {
             anyhow::ensure!(
                 resolve_promotion_input(pt, *argument)? == &CallArg::Pure(expected),
                 "promotion command argument differs from the draft"
