@@ -1,0 +1,154 @@
+---
+title: External validator signer
+description: Design and safety requirements for a fenced Sui validator signer
+---
+
+This document describes the Tomodachi external-validator-signer extension. It is
+an implementation design for the pinned Testnet fork, not an interface supported
+by an upstream Sui release.
+
+## Objective
+
+The extension moves slashable validator operations behind a signer that grants
+one short-lived signing lease at a time. A validator process that loses its
+lease must be unable to produce another accepted authority or consensus
+signature, even when the process and host remain alive.
+
+The signer is the safety boundary. Process supervisors, service discovery, and
+host fencing remain useful for availability and clean network ownership, but a
+failure in those layers must not create two signing authorities.
+
+## Threat model
+
+The first implementation protects against:
+
+- a primary host becoming isolated while its replacement is promoted;
+- stale requests arriving after a lease has expired or been superseded;
+- both validator processes running concurrently because of an orchestration
+  failure;
+- process and signer restarts during a signing operation; and
+- an operator accidentally configuring the same authority on two hosts.
+
+The signer fails closed if it cannot prove exclusive ownership or durably
+record an anti-equivocation decision. It does not attempt to remain available
+through a partition that separates it from durable lease state.
+
+The initial implementation does not protect a compromised signer host or a
+malicious operator with direct access to signer key storage. Those risks require
+an HSM or threshold deployment with an independently audited policy layer.
+
+## Key coverage
+
+A complete Sui validator integration covers more than a generic BLS signing
+endpoint:
+
+| Material | Current use | External-signer requirement |
+| --- | --- | --- |
+| Protocol BLS12-381 key | Authority, effects, and checkpoint signatures; randomness DKG identity | Signatures and all private-key-derived DKG operations stay in the signer |
+| Worker Ed25519 key | Mysticeti block signatures | Every proposed block is authorized and signed by the signer |
+| Network Ed25519 key | Consensus and validator network identity/TLS | Remains a separately fenced transport identity initially |
+| Randomness shares | DKG output and randomness-round partial signatures | Persist and operate inside the signer; never return an exportable share |
+| Account Ed25519 key | On-chain validator administration | Not used by the validator runtime and is outside this protocol |
+
+Returning the BLS private scalar or a recovered randomness share to `sui-node`
+would defeat the custody guarantee. The signer API therefore exposes typed DKG
+and randomness operations, not a private-key export operation.
+
+The network key is not used to authorize a Mysticeti block, checkpoint, or
+transaction effect. Duplicating it can still cause connection-identity and
+liveness problems, so the first deployment combines the signer with a
+single-active supervisor and host fencing. A later transport integration may
+move TLS signing behind a dedicated interface.
+
+## Lease model
+
+The signer maintains one lease record for each validator authority:
+
+```text
+(chain_id, authority) -> {
+    generation,
+    holder_id,
+    issued_at,
+    expires_at
+}
+```
+
+The signer assigns generations monotonically. A holder can renew its current
+lease, but cannot choose a generation or renew a superseded lease. Signing
+requests carry the current generation and are rejected after its signer-owned
+expiry. Client clocks are never trusted for authorization.
+
+A newly acquired lease does not erase anti-equivocation state from an older
+generation. Lease transfer changes who may request signatures, not what the
+authority has already signed.
+
+## Typed signing policy
+
+The service does not provide an unrestricted `sign(bytes)` endpoint. Requests
+are versioned and identify a Sui operation whose structured payload is decoded
+and validated by the signer:
+
+- Mysticeti block proposal;
+- transaction effects;
+- checkpoint summary;
+- DKG message and confirmation; and
+- randomness-round partial signature.
+
+Each request is bound to the chain identifier, authority public key, epoch,
+lease generation, operation domain, and complete canonical payload. The signer
+reconstructs the Sui intent message and verifies that the public key selected by
+the request matches its configured authority.
+
+## Durable anti-equivocation state
+
+Before returning a signature, the signer durably records the operation key and
+payload digest. Repeating an identical request returns the same result.
+Requesting a different payload for a protected operation key is rejected.
+
+At minimum, protected keys include:
+
+- `(chain, epoch, consensus round)` for a proposed Mysticeti block;
+- `(chain, epoch, checkpoint sequence)` for a checkpoint summary;
+- `(chain, epoch, transaction digest)` for transaction effects;
+- `(chain, epoch, DKG stage)` for local DKG contributions; and
+- `(chain, epoch, randomness round)` for randomness partial signatures.
+
+The state transition and signature result are committed atomically. A process
+crash cannot leave a returned signature absent from the durable journal.
+
+## Node behavior
+
+File-backed signing remains the default for upstream-compatible
+configurations. An external configuration names a signer endpoint, expected
+public keys, client identity, request timeout, and lease-renewal policy. It does
+not contain private authority or worker keys.
+
+An externally signed validator:
+
+1. verifies the signer's public keys against its current committee entry;
+2. acquires or resumes the expected lease generation;
+3. renews before a configured safety margin;
+4. stops proposing and serving validator-only requests before lease expiry if
+   renewal fails; and
+5. treats every signer rejection or timeout as a failure to sign, never as a
+   reason to fall back to a local key.
+
+There is no automatic fallback from external signing to key files. Such a
+fallback would bypass the fence during the exact failure mode it is meant to
+contain.
+
+## Delivery stages
+
+1. Introduce a versioned protocol, signer service, durable lease journal, and
+   policy tests without changing the default node path.
+2. Route authority BLS and Mysticeti worker signatures through signer traits
+   and add fail-closed lease handling.
+3. Move DKG state and randomness-share signing into the service.
+4. Exercise two warm nodes against one signer through partitions, delayed
+   requests, crashes, restarts, and forced lease transfer.
+5. Add a replicated or HSM-backed signer deployment only after the
+   single-signer safety model passes adversarial tests.
+
+The fork is not ready for a live validator until all key-coverage stages and
+the failover test matrix pass. Partial externalization must not be presented as
+private-key isolation.
