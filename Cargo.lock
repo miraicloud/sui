@@ -17617,6 +17617,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-validator-signer"
+version = "0.0.0"
+dependencies = [
+ "bcs",
+ "rand 0.8.5",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "sui-verifier-latest"
 version = "0.1.0"
 dependencies = [
