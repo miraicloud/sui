@@ -12,6 +12,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::{bail, ensure};
 use arc_swap::ArcSwap;
+use consensus_core::BlockSigner;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
 use futures::future::BoxFuture;
@@ -260,7 +261,7 @@ const DEFAULT_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SuiNode {
     config: NodeConfig,
-    _external_validator_signer: Option<Arc<BlockingValidatorSigner>>,
+    external_validator_signer: Option<Arc<BlockingValidatorSigner>>,
     validator_components: Mutex<Option<ValidatorComponents>>,
     validator_promotion_guard: Mutex<Option<ValidatorPromotionGuard>>,
 
@@ -692,7 +693,7 @@ impl SuiNode {
                     BlockingValidatorSigner::connect(signer_config.clone(), *chain_id.as_bytes())
                         .context("failed to acquire external validator signer lease")?
                 } else {
-                    BlockingValidatorSigner::standby()
+                    BlockingValidatorSigner::standby(signer_config, *chain_id.as_bytes())?
                 };
                 let handle = Arc::new(signer.clone());
                 (Arc::pin(signer), Some(handle))
@@ -1060,6 +1061,7 @@ impl SuiNode {
         let validator_components = if node_role.runs_consensus() {
             let mut components = Self::construct_validator_components(
                 config.clone(),
+                external_validator_signer.clone(),
                 state.clone(),
                 committee,
                 epoch_store.clone(),
@@ -1133,7 +1135,7 @@ impl SuiNode {
 
         let node = Self {
             config,
-            _external_validator_signer: external_validator_signer,
+            external_validator_signer,
             validator_components: Mutex::new(validator_components),
             validator_promotion_guard: Mutex::new(validator_promotion_guard),
             http_servers,
@@ -1490,6 +1492,7 @@ impl SuiNode {
 
     async fn construct_validator_components(
         config: NodeConfig,
+        external_validator_signer: Option<Arc<BlockingValidatorSigner>>,
         state: Arc<AuthorityState>,
         committee: Arc<Committee>,
         epoch_store: Arc<AuthorityPerEpochStore>,
@@ -1528,6 +1531,7 @@ impl SuiNode {
             registry_service,
             client,
             node_role,
+            external_validator_signer.map(|signer| BlockSigner::new(signer)),
         ));
 
         // This only gets started up once, not on every epoch. (Make call to remove every epoch.)
@@ -2377,6 +2381,7 @@ impl SuiNode {
 
                     let mut components = Self::construct_validator_components(
                         self.config.clone(),
+                        self.external_validator_signer.clone(),
                         self.state.clone(),
                         Arc::new(next_epoch_committee.clone()),
                         new_epoch_store.clone(),

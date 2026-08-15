@@ -61,7 +61,11 @@ mod randomized_tests;
 
 /// Exported Consensus API.
 pub use authority_node::{ConsensusAuthority, NetworkType};
-pub use block::BlockAPI;
+pub use block::{
+    Block, BlockAPI, BlockSigner, BlockSigningService, consensus_block_signing_payload,
+    deserialize_consensus_block, serialize_consensus_block,
+};
+pub use error::{ConsensusError, ConsensusResult};
 
 /// Exported API for testing and tools.
 pub use block::{TestBlock, Transaction, VerifiedBlock};

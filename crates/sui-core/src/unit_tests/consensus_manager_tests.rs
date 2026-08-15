@@ -79,6 +79,7 @@ async fn test_consensus_manager() {
         &registry_service,
         consensus_client,
         sui_types::node_role::NodeRole::Validator,
+        None,
     );
 
     let boot_counter = *manager.boot_counter.lock().await;
@@ -164,6 +165,7 @@ async fn test_consensus_manager_address_update() {
         &registry_service,
         consensus_client,
         NodeRole::Validator,
+        None,
     ));
 
     // Start consensus
@@ -306,6 +308,7 @@ async fn test_consensus_active_address_source_metric() {
         &registry_service,
         consensus_client,
         NodeRole::Validator,
+        None,
     );
 
     // A committee peer's consensus network public key, and its metric label.

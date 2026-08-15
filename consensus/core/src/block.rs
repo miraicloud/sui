@@ -22,6 +22,52 @@ use crate::{
     error::{ConsensusError, ConsensusResult},
 };
 
+/// A custody boundary for Mysticeti block signatures.
+///
+/// Implementations receive the complete typed block so an external signer can
+/// independently derive and validate the canonical signing message.
+pub trait BlockSigningService: Send + Sync {
+    fn public_key(&self) -> ProtocolPublicKey;
+    fn sign_block(&self, block: &Block) -> ConsensusResult<ProtocolKeySignature>;
+}
+
+/// Cloneable signer handle used by the consensus runtime.
+#[derive(Clone)]
+pub struct BlockSigner(Arc<dyn BlockSigningService>);
+
+impl BlockSigner {
+    pub fn new(signer: Arc<dyn BlockSigningService>) -> Self {
+        Self(signer)
+    }
+}
+
+impl From<ProtocolKeyPair> for BlockSigner {
+    fn from(keypair: ProtocolKeyPair) -> Self {
+        Self(Arc::new(keypair))
+    }
+}
+
+impl BlockSigningService for BlockSigner {
+    fn public_key(&self) -> ProtocolPublicKey {
+        self.0.public_key()
+    }
+
+    fn sign_block(&self, block: &Block) -> ConsensusResult<ProtocolKeySignature> {
+        self.0.sign_block(block)
+    }
+}
+
+impl BlockSigningService for ProtocolKeyPair {
+    fn public_key(&self) -> ProtocolPublicKey {
+        self.public()
+    }
+
+    fn sign_block(&self, block: &Block) -> ConsensusResult<ProtocolKeySignature> {
+        let message = consensus_block_signing_payload(block)?;
+        Ok(self.sign(&message))
+    }
+}
+
 pub(crate) const GENESIS_ROUND: Round = 0;
 
 /// Sui transaction in serialised bytes
@@ -462,8 +508,8 @@ impl SignedBlock {
         }
     }
 
-    pub(crate) fn new(block: Block, protocol_keypair: &ProtocolKeyPair) -> ConsensusResult<Self> {
-        let signature = compute_block_signature(&block, protocol_keypair)?;
+    pub(crate) fn new(block: Block, signer: &impl BlockSigningService) -> ConsensusResult<Self> {
+        let signature = signer.sign_block(&block)?;
         Ok(Self {
             inner: block,
             signature: Bytes::copy_from_slice(signature.to_bytes()),
@@ -525,14 +571,17 @@ fn to_consensus_block_intent(digest: InnerBlockDigest) -> IntentMessage<InnerBlo
 /// 1. Compute the digest of `Block`.
 /// 2. Wrap the digest in `IntentMessage`.
 /// 3. Sign the serialized `IntentMessage`, or verify signature against it.
-fn compute_block_signature(
-    block: &Block,
-    protocol_keypair: &ProtocolKeyPair,
-) -> ConsensusResult<ProtocolKeySignature> {
+pub fn consensus_block_signing_payload(block: &Block) -> ConsensusResult<Vec<u8>> {
     let digest = compute_inner_block_digest(block)?;
-    let message = bcs::to_bytes(&to_consensus_block_intent(digest))
-        .map_err(ConsensusError::SerializationFailure)?;
-    Ok(protocol_keypair.sign(&message))
+    bcs::to_bytes(&to_consensus_block_intent(digest)).map_err(ConsensusError::SerializationFailure)
+}
+
+pub fn serialize_consensus_block(block: &Block) -> ConsensusResult<Vec<u8>> {
+    bcs::to_bytes(block).map_err(ConsensusError::SerializationFailure)
+}
+
+pub fn deserialize_consensus_block(bytes: &[u8]) -> ConsensusResult<Block> {
+    bcs::from_bytes(bytes).map_err(ConsensusError::MalformedBlock)
 }
 
 fn verify_block_signature(
@@ -540,9 +589,7 @@ fn verify_block_signature(
     signature: &[u8],
     protocol_pubkey: &ProtocolPublicKey,
 ) -> ConsensusResult<()> {
-    let digest = compute_inner_block_digest(block)?;
-    let message = bcs::to_bytes(&to_consensus_block_intent(digest))
-        .map_err(ConsensusError::SerializationFailure)?;
+    let message = consensus_block_signing_payload(block)?;
     let sig =
         ProtocolKeySignature::from_bytes(signature).map_err(ConsensusError::MalformedSignature)?;
     protocol_pubkey

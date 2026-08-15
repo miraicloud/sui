@@ -4,6 +4,9 @@
 use std::sync::Arc;
 
 use consensus_config::ProtocolKeyPair;
+use consensus_core::{
+    BlockAPI as _, ConsensusError, consensus_block_signing_payload, deserialize_consensus_block,
+};
 use fastcrypto::{
     hash::{Blake2b256, HashFunction},
     traits::{KeyPair as _, Signer as _, ToFromBytes as _},
@@ -132,6 +135,12 @@ impl SignerService {
         {
             return Err(ServiceError::AuthorityOperationMismatch);
         }
+        if let OperationKey::ConsensusBlock { epoch, round, .. } = operation {
+            let block = deserialize_consensus_block(payload)?;
+            if block.epoch() != *epoch || block.round() != *round {
+                return Err(ServiceError::ConsensusOperationMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -148,7 +157,12 @@ fn verify_holder(
 
 fn sign(keys: &SignerKeys, operation: &OperationKey, payload: &[u8]) -> Result<Vec<u8>, String> {
     match operation {
-        OperationKey::ConsensusBlock { .. } => Ok(keys.worker.sign(payload).to_bytes().to_vec()),
+        OperationKey::ConsensusBlock { .. } => {
+            let block = deserialize_consensus_block(payload).map_err(|error| error.to_string())?;
+            let message =
+                consensus_block_signing_payload(&block).map_err(|error| error.to_string())?;
+            Ok(keys.worker.sign(&message).to_bytes().to_vec())
+        }
         OperationKey::TransactionEffects { .. } | OperationKey::CheckpointSummary { .. } => {
             let signature: AuthoritySignature = keys.protocol.sign(payload);
             Ok(signature.as_ref().to_vec())
@@ -202,6 +216,10 @@ enum ServiceError {
     TypedRandomnessOperationRequired,
     #[error("authority signing payload does not match its operation key")]
     AuthorityOperationMismatch,
+    #[error("consensus block does not match its operation key")]
+    ConsensusOperationMismatch,
+    #[error("invalid consensus block: {0}")]
+    ConsensusBlock(#[from] ConsensusError),
     #[error(transparent)]
     AuthorityPayload(#[from] AuthorityPayloadError),
     #[error("invalid signer request: {0}")]
@@ -220,6 +238,8 @@ impl From<ServiceError> for Status {
             | ServiceError::InvalidPayloadSize
             | ServiceError::TypedRandomnessOperationRequired
             | ServiceError::AuthorityOperationMismatch
+            | ServiceError::ConsensusOperationMismatch
+            | ServiceError::ConsensusBlock(_)
             | ServiceError::AuthorityPayload(_)
             | ServiceError::Decode(_) => Status::invalid_argument(error.to_string()),
             ServiceError::Policy(
@@ -252,6 +272,7 @@ impl From<ServiceError> for Status {
 #[cfg(test)]
 mod tests {
     use consensus_config::{ProtocolKeySignature, ProtocolPublicKey};
+    use consensus_core::{TestBlock, consensus_block_signing_payload, serialize_consensus_block};
     use fastcrypto::traits::{ToFromBytes as _, VerifyingKey as _};
     use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
     use sui_types::crypto::{
@@ -348,7 +369,8 @@ mod tests {
         let fixture = Fixture::new();
         let holder_id = [1; 32];
         let credential = fixture.acquire(holder_id);
-        let payload = b"consensus block intent".to_vec();
+        let block = TestBlock::new(11, 0).set_epoch(9).build();
+        let payload = serialize_consensus_block(&block).unwrap();
         let signature = fixture
             .sign(
                 holder_id,
@@ -362,7 +384,8 @@ mod tests {
             )
             .unwrap();
         let signature = ProtocolKeySignature::from_bytes(&signature).unwrap();
-        fixture.worker_public.verify(&payload, &signature).unwrap();
+        let message = consensus_block_signing_payload(&block).unwrap();
+        fixture.worker_public.verify(&message, &signature).unwrap();
     }
 
     #[test]
@@ -407,16 +430,30 @@ mod tests {
             epoch: 9,
             round: 11,
         };
+        let first = serialize_consensus_block(
+            &TestBlock::new(11, 0)
+                .set_epoch(9)
+                .set_timestamp_ms(1)
+                .build(),
+        )
+        .unwrap();
+        let conflicting = serialize_consensus_block(
+            &TestBlock::new(11, 0)
+                .set_epoch(9)
+                .set_timestamp_ms(2)
+                .build(),
+        )
+        .unwrap();
 
         assert!(matches!(
-            fixture.sign([2; 32], credential.clone(), block.clone(), vec![1]),
+            fixture.sign([2; 32], credential.clone(), block.clone(), first.clone()),
             Err(ServiceError::ClientIdentityMismatch)
         ));
         fixture
-            .sign(holder_id, credential.clone(), block.clone(), vec![1])
+            .sign(holder_id, credential.clone(), block.clone(), first.clone())
             .unwrap();
         assert!(matches!(
-            fixture.sign(holder_id, credential.clone(), block, vec![2]),
+            fixture.sign(holder_id, credential.clone(), block, conflicting),
             Err(ServiceError::Policy(PolicyError::Equivocation))
         ));
         assert!(matches!(
@@ -428,7 +465,7 @@ mod tests {
                     epoch: 9,
                     round: 12,
                 },
-                vec![3]
+                first
             ),
             Err(ServiceError::ChainMismatch)
         ));

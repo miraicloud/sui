@@ -17626,6 +17626,7 @@ dependencies = [
  "bcs",
  "clap",
  "consensus-config",
+ "consensus-core",
  "fastcrypto",
  "hex",
  "prost 0.14.1",

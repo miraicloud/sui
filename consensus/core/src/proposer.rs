@@ -3,7 +3,6 @@
 
 use std::{collections::BTreeSet, iter, sync::Arc, time::Duration};
 
-use consensus_config::ProtocolKeyPair;
 use consensus_types::block::{BlockRef, BlockTimestampMs, Round};
 use parking_lot::RwLock;
 use tokio::time::Instant;
@@ -12,8 +11,8 @@ use tracing::{debug, info, trace};
 use crate::{
     ancestor::{AncestorState, AncestorStateManager},
     block::{
-        Block, BlockAPI, BlockV1, BlockV2, ExtendedBlock, GENESIS_ROUND, SignedBlock, Slot,
-        VerifiedBlock,
+        Block, BlockAPI, BlockSigner, BlockV1, BlockV2, ExtendedBlock, GENESIS_ROUND, SignedBlock,
+        Slot, VerifiedBlock,
     },
     context::Context,
     dag_state::DagState,
@@ -74,7 +73,7 @@ pub(crate) struct ValidatorProposer {
     transaction_vote_tracker: TransactionVoteTracker,
     propagation_delay: Round,
     last_included_ancestors: Vec<Option<BlockRef>>,
-    block_signer: ProtocolKeyPair,
+    block_signer: BlockSigner,
     last_known_proposed_round: Option<Round>,
     ancestor_state_manager: AncestorStateManager,
     round_tracker: Arc<RwLock<RoundTracker>>,
@@ -88,7 +87,7 @@ impl ValidatorProposer {
         context: Arc<Context>,
         transaction_pool: Arc<dyn TransactionPool>,
         transaction_vote_tracker: TransactionVoteTracker,
-        block_signer: ProtocolKeyPair,
+        block_signer: BlockSigner,
         last_known_proposed_round: Option<Round>,
         ancestor_state_manager: AncestorStateManager,
         round_tracker: Arc<RwLock<RoundTracker>>,

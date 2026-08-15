@@ -7,7 +7,6 @@ use std::{
     vec,
 };
 
-use consensus_config::ProtocolKeyPair;
 #[cfg(test)]
 use consensus_config::{AuthorityIndex, Stake, local_committee_and_keys};
 use consensus_types::block::{BlockRef, Round};
@@ -91,11 +90,12 @@ impl Core {
         block_manager: BlockManager,
         commit_observer: CommitObserver,
         signals: CoreSignals,
-        block_signer: ProtocolKeyPair,
+        block_signer: impl Into<crate::BlockSigner>,
         dag_state: Arc<RwLock<DagState>>,
         sync_last_known_own_block: bool,
         round_tracker: Arc<RwLock<RoundTracker>>,
     ) -> Self {
+        let block_signer = block_signer.into();
         let last_decided_leader = dag_state.read().last_commit_leader();
         let number_of_leaders = context.protocol_config.num_leaders_per_round().unwrap_or(1);
 

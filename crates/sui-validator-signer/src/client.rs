@@ -258,6 +258,7 @@ mod tests {
     use std::fs;
 
     use consensus_config::ProtocolKeyPair;
+    use consensus_core::{TestBlock, consensus_block_signing_payload, serialize_consensus_block};
     use fastcrypto::traits::{KeyPair as _, ToFromBytes as _, VerifyingKey as _};
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -333,6 +334,7 @@ mod tests {
         let (_, worker): (_, NetworkKeyPair) = get_key_pair();
         let worker = ProtocolKeyPair::new(worker);
         let protocol_public = protocol.public().clone();
+        let worker_public = worker.public();
         let expected_protocol_public_key = hex::encode(protocol.public().as_bytes());
         let expected_worker_public_key = hex::encode(worker.public().to_bytes());
         let policy = SignerPolicy::open(
@@ -373,6 +375,8 @@ mod tests {
         };
         let mut client = SignerRpcClient::connect(&config).await.unwrap();
         let credential = client.acquire_lease().await.unwrap().credential;
+        let block = TestBlock::new(2, 0).set_epoch(1).build();
+        let serialized_block = serialize_consensus_block(&block).unwrap();
         let signature = client
             .sign(
                 credential.clone(),
@@ -381,21 +385,37 @@ mod tests {
                     epoch: 1,
                     round: 2,
                 },
-                b"block intent".to_vec(),
+                serialized_block,
             )
             .await
             .unwrap();
-        assert!(!signature.is_empty());
+        let signature = consensus_config::ProtocolKeySignature::from_bytes(&signature).unwrap();
+        worker_public
+            .verify(
+                &consensus_block_signing_payload(&block).unwrap(),
+                &signature,
+            )
+            .unwrap();
         client.renew_lease(&credential).await.unwrap();
         client.release_lease(credential).await.unwrap();
 
-        let blocking = tokio::task::spawn_blocking({
+        let (blocking, block_signature) = tokio::task::spawn_blocking({
             let config = config.clone();
-            move || BlockingAuthoritySigner::connect(config, [7; 32])
+            move || {
+                let blocking = BlockingAuthoritySigner::connect(config, [7; 32]).unwrap();
+                let signature = blocking.sign_consensus_block(&block).unwrap();
+                (blocking, signature)
+            }
         })
         .await
-        .unwrap()
         .unwrap();
+        worker_public
+            .verify(
+                &consensus_block_signing_payload(&TestBlock::new(2, 0).set_epoch(1).build())
+                    .unwrap(),
+                &block_signature,
+            )
+            .unwrap();
         let mut payload = bcs::to_bytes(&IntentMessage::new(
             Intent::sui_app(IntentScope::TransactionEffects),
             TransactionEffects::default(),

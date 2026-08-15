@@ -3,7 +3,15 @@
 
 use std::{sync::mpsc as std_mpsc, thread, time::Duration};
 
-use fastcrypto::traits::{Signer, ToFromBytes as _};
+use consensus_config::{ProtocolKeySignature, ProtocolPublicKey};
+use consensus_core::{
+    Block, BlockAPI as _, BlockSigningService, ConsensusError, ConsensusResult,
+    serialize_consensus_block,
+};
+use fastcrypto::{
+    ed25519::Ed25519PublicKey,
+    traits::{Signer, ToFromBytes as _},
+};
 use sui_types::crypto::AuthoritySignature;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -20,6 +28,8 @@ const COMMAND_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct BlockingValidatorSigner {
     commands: Option<mpsc::Sender<Command>>,
+    worker_public_key: ProtocolPublicKey,
+    chain_id: ChainId,
 }
 
 pub type BlockingAuthoritySigner = BlockingValidatorSigner;
@@ -29,6 +39,7 @@ impl BlockingValidatorSigner {
         config: ExternalSignerConfig,
         chain_id: ChainId,
     ) -> Result<Self, BlockingSignerError> {
+        let worker_public_key = configured_worker_public_key(&config)?;
         let startup_timeout =
             Duration::from_millis(config.request_timeout_ms.saturating_mul(3).max(1_000));
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
@@ -41,6 +52,8 @@ impl BlockingValidatorSigner {
         match startup_receiver.recv_timeout(startup_timeout) {
             Ok(Ok(())) => Ok(Self {
                 commands: Some(commands),
+                worker_public_key,
+                chain_id,
             }),
             Ok(Err(message)) => Err(BlockingSignerError::Startup(message)),
             Err(std_mpsc::RecvTimeoutError::Timeout) => Err(BlockingSignerError::StartupTimeout),
@@ -52,8 +65,15 @@ impl BlockingValidatorSigner {
 
     /// Creates a signer handle for a non-validator process. It deliberately has no
     /// remote lease and fails closed if any authority signing path reaches it.
-    pub fn standby() -> Self {
-        Self { commands: None }
+    pub fn standby(
+        config: &ExternalSignerConfig,
+        chain_id: ChainId,
+    ) -> Result<Self, BlockingSignerError> {
+        Ok(Self {
+            commands: None,
+            worker_public_key: configured_worker_public_key(config)?,
+            chain_id,
+        })
     }
 
     pub fn sign_authority(
@@ -74,6 +94,32 @@ impl BlockingValidatorSigner {
             .map_err(|_| BlockingSignerError::WorkerStopped)??;
         AuthoritySignature::from_bytes(&bytes).map_err(BlockingSignerError::InvalidSignature)
     }
+
+    pub fn sign_consensus_block(
+        &self,
+        block: &Block,
+    ) -> Result<ProtocolKeySignature, BlockingSignerError> {
+        let payload = serialize_consensus_block(block)?;
+        let operation = crate::protocol::OperationKey::ConsensusBlock {
+            chain_id: self.chain_id,
+            epoch: block.epoch(),
+            round: block.round(),
+        };
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(BlockingSignerError::Standby)?
+            .blocking_send(Command::SignConsensusBlock {
+                operation,
+                payload,
+                response: sender,
+            })
+            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+        let bytes = receiver
+            .recv()
+            .map_err(|_| BlockingSignerError::WorkerStopped)??;
+        ProtocolKeySignature::from_bytes(&bytes).map_err(BlockingSignerError::InvalidSignature)
+    }
 }
 
 impl Signer<AuthoritySignature> for BlockingValidatorSigner {
@@ -83,8 +129,24 @@ impl Signer<AuthoritySignature> for BlockingValidatorSigner {
     }
 }
 
+impl BlockSigningService for BlockingValidatorSigner {
+    fn public_key(&self) -> ProtocolPublicKey {
+        self.worker_public_key.clone()
+    }
+
+    fn sign_block(&self, block: &Block) -> ConsensusResult<ProtocolKeySignature> {
+        self.sign_consensus_block(block)
+            .map_err(|error| ConsensusError::BlockSigningFailure(error.to_string()))
+    }
+}
+
 enum Command {
     SignAuthority {
+        payload: Vec<u8>,
+        response: std_mpsc::SyncSender<Result<Vec<u8>, BlockingSignerError>>,
+    },
+    SignConsensusBlock {
+        operation: crate::protocol::OperationKey,
         payload: Vec<u8>,
         response: std_mpsc::SyncSender<Result<Vec<u8>, BlockingSignerError>>,
     },
@@ -160,10 +222,30 @@ async fn run_async(
                         .await;
                         let _ = response.send(result);
                     }
+                    Command::SignConsensusBlock {
+                        operation,
+                        payload,
+                        response,
+                    } => {
+                        let result = client
+                            .sign(credential.clone(), operation, payload)
+                            .await
+                            .map_err(BlockingSignerError::Client);
+                        let _ = response.send(result);
+                    }
                 }
             }
         }
     }
+}
+
+fn configured_worker_public_key(
+    config: &ExternalSignerConfig,
+) -> Result<ProtocolPublicKey, BlockingSignerError> {
+    let keys = config.expected_public_keys()?;
+    let key = Ed25519PublicKey::from_bytes(&keys.worker_ed25519)
+        .map_err(BlockingSignerError::InvalidSignature)?;
+    Ok(ProtocolPublicKey::new(key))
 }
 
 async fn sign_authority(
@@ -193,6 +275,8 @@ pub enum BlockingSignerError {
     WorkerStopped,
     #[error(transparent)]
     AuthorityPayload(#[from] AuthorityPayloadError),
+    #[error("invalid consensus block signing request: {0}")]
+    Consensus(#[from] ConsensusError),
     #[error("external signer request failed: {0}")]
     Client(#[from] ClientError),
     #[error("external signer returned an invalid BLS signature: {0}")]
@@ -201,11 +285,25 @@ pub enum BlockingSignerError {
 
 #[cfg(test)]
 mod tests {
+    use fastcrypto::traits::KeyPair as _;
+
     use super::*;
 
     #[test]
     fn standby_signer_fails_closed_without_connecting() {
-        let signer = BlockingValidatorSigner::standby();
+        let (_, worker): (_, sui_types::crypto::NetworkKeyPair) = sui_types::crypto::get_key_pair();
+        let config = ExternalSignerConfig {
+            endpoint: "https://127.0.0.1:1".to_owned(),
+            server_name: "unused".to_owned(),
+            ca_certificate_path: "unused".into(),
+            client_certificate_path: "unused".into(),
+            client_private_key_path: "unused".into(),
+            expected_protocol_public_key: hex::encode([1; 96]),
+            expected_worker_public_key: hex::encode(worker.public().as_bytes()),
+            request_timeout_ms: 1_000,
+            lease_ttl_ms: 5_000,
+        };
+        let signer = BlockingValidatorSigner::standby(&config, [7; 32]).unwrap();
         assert!(matches!(
             signer.sign_authority(b"must not sign"),
             Err(BlockingSignerError::Standby)

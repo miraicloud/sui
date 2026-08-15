@@ -6,9 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use consensus_config::ProtocolKeyPair;
 use consensus_config::{
     Committee, ConsensusProtocolConfig, NetworkKeyPair, NetworkPublicKey, Parameters,
-    ProtocolKeyPair,
 };
 use consensus_types::block::Round;
 use itertools::Itertools;
@@ -19,7 +20,8 @@ use prometheus::Registry;
 use tracing::{info, warn};
 
 use crate::{
-    BlockAPI as _, CommitConsumerArgs, RandomnessSignatureHandler,
+    BlockAPI as _, BlockSigner, BlockSigningService as _, CommitConsumerArgs,
+    RandomnessSignatureHandler,
     authority_service::AuthorityService,
     block_manager::BlockManager,
     block_sync_service::BlockSyncService,
@@ -67,7 +69,7 @@ impl ConsensusAuthority {
         parameters: Parameters,
         protocol_config: ConsensusProtocolConfig,
         // Only required for validator nodes. Observer nodes don't have a protocol keypair.
-        protocol_keypair: Option<ProtocolKeyPair>,
+        block_signer: Option<BlockSigner>,
         network_keypair: NetworkKeyPair,
         clock: Arc<Clock>,
         transaction_verifier: Arc<dyn TransactionVerifier>,
@@ -89,7 +91,7 @@ impl ConsensusAuthority {
                     committee,
                     parameters,
                     protocol_config,
-                    protocol_keypair,
+                    block_signer,
                     network_keypair,
                     clock,
                     transaction_verifier,
@@ -195,7 +197,7 @@ where
         committee: Committee,
         parameters: Parameters,
         protocol_config: ConsensusProtocolConfig,
-        protocol_keypair: Option<ProtocolKeyPair>,
+        block_signer: Option<BlockSigner>,
         network_keypair: NetworkKeyPair,
         clock: Arc<Clock>,
         transaction_verifier: Arc<dyn TransactionVerifier>,
@@ -208,10 +210,10 @@ where
         let metrics = initialise_metrics(registry);
 
         // If a protocol key pair is provided, then this is a validator node.
-        let own_index = if let Some(protocol_keypair) = &protocol_keypair {
+        let own_index = if let Some(block_signer) = &block_signer {
             let (own_index, _) = committee
                 .authorities()
-                .find(|(_, a)| a.protocol_key == protocol_keypair.public())
+                .find(|(_, a)| a.protocol_key == block_signer.public_key())
                 .expect("Own authority should be among the consensus authorities!");
 
             let own_hostname = committee.authority(own_index).hostname.clone();
@@ -376,7 +378,7 @@ where
                 block_manager,
                 commit_observer,
                 core_signals,
-                protocol_keypair.expect("protocol keypair is required when running as validator"),
+                block_signer.expect("block signer is required when running as validator"),
                 dag_state.clone(),
                 sync_last_known_own_block,
                 round_tracker.clone(),
@@ -758,7 +760,7 @@ mod tests {
             committee,
             parameters,
             ConsensusProtocolConfig::for_testing(),
-            Some(protocol_keypair),
+            Some(protocol_keypair.into()),
             network_keypair,
             Arc::new(Clock::default()),
             Arc::new(txn_verifier),
@@ -1355,7 +1357,7 @@ mod tests {
             committee,
             parameters,
             protocol_config,
-            Some(protocol_keypair),
+            Some(protocol_keypair.into()),
             network_keypair,
             Arc::new(Clock::default()),
             Arc::new(txn_verifier),

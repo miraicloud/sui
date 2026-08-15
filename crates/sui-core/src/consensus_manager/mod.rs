@@ -12,8 +12,8 @@ use consensus_config::{
     NetworkPublicKey as ConsensusNetworkPublicKey, Parameters, ProtocolKeyPair, Stake,
 };
 use consensus_core::{
-    Clock, CommitConsumerArgs, CommitConsumerMonitor, CommitIndex, ConsensusAuthority, NetworkType,
-    RandomnessSignatureHandler, storage::rocksdb_store::RocksDBStore,
+    BlockSigner, Clock, CommitConsumerArgs, CommitConsumerMonitor, CommitIndex, ConsensusAuthority,
+    NetworkType, RandomnessSignatureHandler, storage::rocksdb_store::RocksDBStore,
 };
 use core::panic;
 use fastcrypto::encoding::{Encoding, Hex};
@@ -180,7 +180,7 @@ fn to_consensus_protocol_config(config: &ProtocolConfig) -> ConsensusProtocolCon
 /// Supports both validator mode (with protocol keypair) and observer mode (without).
 pub struct ConsensusManager {
     consensus_config: ConsensusConfig,
-    protocol_keypair: Option<ProtocolKeyPair>,
+    block_signer: Option<BlockSigner>,
     network_keypair: NetworkKeyPair,
     storage_base_path: PathBuf,
     metrics: Arc<ConsensusManagerMetrics>,
@@ -219,20 +219,23 @@ impl ConsensusManager {
         registry_service: &RegistryService,
         consensus_client: Arc<UpdatableConsensusClient>,
         node_role: NodeRole,
+        external_block_signer: Option<BlockSigner>,
     ) -> Self {
         let metrics = Arc::new(ConsensusManagerMetrics::new(
             &registry_service.default_registry(),
         ));
         let client = Arc::new(LazyMysticetiClient::new());
         let (consumer_monitor_sender, _) = broadcast::channel(1);
-        let protocol_keypair = if node_role.is_validator() {
-            Some(ProtocolKeyPair::new(node_config.worker_key_pair().copy()))
+        let block_signer = if node_role.is_validator() {
+            Some(external_block_signer.unwrap_or_else(|| {
+                ProtocolKeyPair::new(node_config.worker_key_pair().copy()).into()
+            }))
         } else {
             None
         };
         Self {
             consensus_config: consensus_config.clone(),
-            protocol_keypair,
+            block_signer,
             network_keypair: NetworkKeyPair::new(node_config.network_key_pair().copy()),
             storage_base_path: consensus_config.db_path().to_path_buf(),
             metrics,
@@ -349,7 +352,7 @@ impl ConsensusManager {
             committee.clone(),
             parameters.clone(),
             consensus_protocol_config,
-            self.protocol_keypair.clone(),
+            self.block_signer.clone(),
             self.network_keypair.clone(),
             Arc::new(Clock::default()),
             Arc::new(tx_validator.clone()),

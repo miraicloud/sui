@@ -376,7 +376,7 @@ pub(crate) async fn make_authority(
         committee,
         parameters,
         protocol_config,
-        protocol_keypair,
+        protocol_keypair.map(Into::into),
         network_keypair,
         Arc::new(Clock::new_for_test(clock_drift)),
         transaction_verifier,

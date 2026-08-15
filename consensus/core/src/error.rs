@@ -92,6 +92,9 @@ pub enum ConsensusError {
     #[error("Failed to verify the block's signature: {0}")]
     SignatureVerificationFailure(FastCryptoError),
 
+    #[error("Block signing failed: {0}")]
+    BlockSigningFailure(String),
+
     #[error("Synchronizer for fetching blocks directly from {0} is saturated")]
     SynchronizerSaturated(String),
 
