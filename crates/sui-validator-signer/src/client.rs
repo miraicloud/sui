@@ -12,7 +12,9 @@ use tonic::{
 
 use crate::{
     config::ensure_private_file,
-    protocol::{LeaseCredential, OperationKey, Request, RequestV1, Response, ResponseV1},
+    protocol::{
+        LeaseCredential, OperationKey, Request, RequestV1, Response, ResponseV1, SignerStatus,
+    },
     rpc::{RpcRequest, ValidatorSignerClient},
 };
 
@@ -118,6 +120,13 @@ impl SignerRpcClient {
                 protocol_bls12381,
                 worker_ed25519,
             }),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn get_status(&mut self) -> Result<SignerStatus, ClientError> {
+        match self.call(RequestV1::GetStatus).await? {
+            ResponseV1::Status(status) => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -389,6 +398,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let status = client.get_status().await.unwrap();
+        assert_eq!(status.decision_count, 1);
+        assert_eq!(
+            status.current_lease.as_ref().unwrap().holder_id,
+            credential.holder_id
+        );
+        assert_eq!(
+            status.current_lease.unwrap().generation,
+            credential.generation
+        );
         let signature = consensus_config::ProtocolKeySignature::from_bytes(&signature).unwrap();
         worker_public
             .verify(

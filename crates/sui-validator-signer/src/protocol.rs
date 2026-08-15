@@ -25,6 +25,21 @@ pub struct LeaseCredential {
     pub lease_id: LeaseId,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SignerStatus {
+    pub current_lease: Option<LeaseStatus>,
+    pub next_generation: u64,
+    pub last_seen_unix_ms: u64,
+    pub decision_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LeaseStatus {
+    pub holder_id: HolderId,
+    pub generation: u64,
+    pub expires_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum OperationKey {
     ConsensusBlock {
@@ -95,6 +110,7 @@ pub enum RequestV1 {
         operation: OperationKey,
         payload: Vec<u8>,
     },
+    GetStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -111,4 +127,5 @@ pub enum ResponseV1 {
     Lease(LeaseGrant),
     Released,
     Signature(Vec<u8>),
+    Status(SignerStatus),
 }

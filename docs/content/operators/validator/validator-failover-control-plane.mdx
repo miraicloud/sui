@@ -1,0 +1,119 @@
+---
+title: Validator failover control plane
+description: Operator application for observing and safely promoting a warm Sui validator
+---
+
+The Tomodachi failover control plane is the operator-facing layer above the
+external validator signer. It presents the primary and backup side by side,
+evaluates promotion readiness, and performs an immediate fenced handoff without
+an on-chain metadata transaction or an epoch-boundary wait.
+
+“Immediate” means one signer lease handoff, normally a few seconds. It does not
+mean that two validator processes are briefly allowed to sign. The signer, not
+the web application, is the single-active safety authority.
+
+## Components
+
+```text
+                         read metrics and status
+                  +--------------------------------+
+                  |                                v
+            +-----+------+                  +------+------+
+ operator ->| control API |----------------->|  dashboard  |
+            +-----+------+                  +-------------+
+                  |
+          authenticated commands
+          +-------+---------+
+          |                 |
+          v                 v
+ +--------+--------+ +------+----------+
+ | primary agent   | | backup agent    |
+ | sui-node active | | observer warm   |
+ +--------+--------+ +------+----------+
+          |                 |
+          +--------+--------+
+                   v
+        +----------+-----------+
+        | external signer      |
+        | one lease generation |
+        | durable decisions    |
+        +----------------------+
+```
+
+The dashboard reads Sui metrics from both nodes, signer status over mutually
+authenticated TLS, and supervisor status from a small host agent. The host
+agent exposes a narrow allowlist of operations; it is not a remote shell.
+
+## Readiness view
+
+The comparison view must show at least:
+
+- process and supervisor state;
+- current epoch and executed checkpoint;
+- consensus last commit index and observer subscription progress;
+- checkpoint and commit lag relative to the primary and an independent Testnet
+  endpoint;
+- protocol, worker, and network public-key fingerprints;
+- signer lease holder, generation, and signer-owned expiry;
+- voting right and current committee identity;
+- randomness DKG status and whether local randomness shares are available; and
+- time synchronization, disk space, database health, and recent crash loops.
+
+Promotion is disabled when identity fingerprints differ, the backup is outside
+configured lag bounds, its database is unhealthy, the signer is unavailable,
+or a different promotion operation is already in progress. The stage-2
+randomness-observer limitation is displayed as a degraded readiness condition,
+not hidden.
+
+## Fenced promotion
+
+Every promotion has an immutable operation ID, expected source lease
+generation, source and target host IDs, and a complete audit trail. Its durable
+state machine is:
+
+```text
+READY -> DRAINING_SOURCE -> WAITING_FOR_LEASE_FENCE
+      -> STARTING_TARGET -> VERIFYING_TARGET -> COMPLETE
+```
+
+The control API performs these steps:
+
+1. Re-read all readiness inputs and bind them to the promotion operation.
+2. Stop the source validator and request a graceful signer lease release.
+3. If the source cannot release, wait for the signer-owned lease expiry. Never
+   override an unexpired lease from the dashboard.
+4. Confirm that the signer reports no active source lease and that the source
+   host agent reports the validator stopped.
+5. Activate the backup's validator profile and start `sui-node`. The node
+   acquires the next signer lease generation before it can sign.
+6. Verify the target owns the lease, proposes Mysticeti blocks, advances commit
+   and checkpoint metrics, and has no key or committee mismatch.
+7. Mark the operation complete. Keep the old primary stopped and convert it to
+   the warm observer profile only after the new primary is healthy.
+
+Rollback is another promotion in the opposite direction. It first fences the
+new primary and waits for its lease release or expiry; it never starts the old
+primary as a shortcut.
+
+## Control API sketch
+
+The initial API is deliberately small:
+
+```text
+GET  /v1/validators
+GET  /v1/validators/{host}/readiness
+GET  /v1/signer/status
+POST /v1/promotions
+GET  /v1/promotions/{operation_id}
+POST /v1/promotions/{operation_id}/cancel
+```
+
+Creating a promotion requires an idempotency key, the expected active host and
+lease generation, and an operator confirmation token. Cancellation is accepted
+only before the target acquires a lease. All mutating calls are authenticated,
+authorized, rate limited, and written to an append-only audit log.
+
+Automatic failover is out of scope for the first release. The first version
+provides excellent evidence and one deliberate promotion action. Automation can
+be enabled only after repeated fire drills establish safe thresholds for lag,
+network partitions, slow shutdown, signer loss, and restart recovery.

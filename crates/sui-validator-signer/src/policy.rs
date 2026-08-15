@@ -15,7 +15,9 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{Digest, HolderId, LeaseCredential, LeaseGrant, LeaseId, OperationKey};
+use crate::protocol::{
+    Digest, HolderId, LeaseCredential, LeaseGrant, LeaseId, LeaseStatus, OperationKey, SignerStatus,
+};
 
 const STATE_VERSION: u16 = 1;
 const JOURNAL_CHECKSUM_BYTES: usize = 32;
@@ -307,6 +309,20 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
         Ok(lease.grant())
     }
 
+    pub fn status(&self) -> Result<SignerStatus, PolicyError> {
+        let state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
+        Ok(SignerStatus {
+            current_lease: state.current_lease.as_ref().map(|lease| LeaseStatus {
+                holder_id: lease.holder_id,
+                generation: lease.generation,
+                expires_at_unix_ms: lease.expires_at_unix_ms,
+            }),
+            next_generation: state.next_generation,
+            last_seen_unix_ms: state.last_seen_unix_ms,
+            decision_count: state.decisions.len() as u64,
+        })
+    }
+
     pub fn renew(
         &self,
         credential: &LeaseCredential,
@@ -569,6 +585,10 @@ mod tests {
             PolicyError::LeaseHeld { generation: 1, .. }
         ));
         assert_eq!(first.generation, 1);
+        let status = policy.status().unwrap();
+        assert_eq!(status.next_generation, 2);
+        assert_eq!(status.decision_count, 0);
+        assert_eq!(status.current_lease.unwrap().holder_id, holder(1));
     }
 
     #[test]
