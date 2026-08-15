@@ -350,6 +350,14 @@ async fn real_mtls_services_fence_a_stale_source_before_target_signing() {
         .unwrap();
     assert_eq!(record.target_generation, Some(source_lease.generation + 1));
     assert!(target_signer_handle.lock().unwrap().is_some());
+    let snapshot = control.snapshot().await.unwrap();
+    let source = snapshot
+        .hosts
+        .iter()
+        .find(|host| host.host_id == "source")
+        .unwrap();
+    assert_eq!(source.status.profile, Some(NodeProfile::Observer));
+    assert_eq!(source.status.service_state, ServiceState::Active);
 
     let stale_result = stale_source
         .randomness_partial_sign(source_lease, CHAIN_ID, EPOCH, 99)

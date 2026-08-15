@@ -195,6 +195,8 @@ pub enum PromotionPhase {
     TargetObserverStopped,
     TargetStarted,
     Complete,
+    // Appended to preserve the BCS discriminants of already persisted phases.
+    TargetVerified,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -447,6 +449,20 @@ impl ControlPlane {
                 .wait_for_target_ready(target, baseline, expected_source_generation)
                 .await?;
             record.target_generation = Some(generation);
+            self.advance(&mut record, PromotionPhase::TargetVerified)
+                .await?;
+        }
+
+        if record.phase == PromotionPhase::TargetVerified {
+            let status = source
+                .agent
+                .activate(
+                    agent_operation_id(&operation_id, "start-source-observer"),
+                    NodeProfile::Observer,
+                )
+                .await
+                .map_err(|error| ControlError::Agent(source_host.clone(), error))?;
+            require_service(&status, NodeProfile::Observer, ServiceState::Active)?;
             self.advance(&mut record, PromotionPhase::Complete).await?;
         }
 
@@ -1057,11 +1073,17 @@ mod tests {
         assert_eq!(record.target_generation, Some(2));
         assert_eq!(
             *shared.events.lock().unwrap(),
-            vec!["source-stop", "target-stop", "target-activate-Validator"]
+            vec![
+                "source-stop",
+                "target-stop",
+                "target-activate-Validator",
+                "source-activate-Observer"
+            ]
         );
         {
             let hosts = shared.hosts.lock().unwrap();
-            assert_eq!(hosts["source"].service_state, ServiceState::Inactive);
+            assert_eq!(hosts["source"].service_state, ServiceState::Active);
+            assert_eq!(hosts["source"].profile, Some(NodeProfile::Observer));
             assert_eq!(hosts["target"].profile, Some(NodeProfile::Validator));
         }
 
@@ -1075,7 +1097,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeated, record);
-        assert_eq!(shared.events.lock().unwrap().len(), 3);
+        assert_eq!(shared.events.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]

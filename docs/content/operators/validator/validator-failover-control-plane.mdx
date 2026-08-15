@@ -79,7 +79,8 @@ state machine is:
 
 ```text
 READY -> DRAINING_SOURCE -> WAITING_FOR_LEASE_FENCE
-      -> STARTING_TARGET -> VERIFYING_TARGET -> COMPLETE
+      -> STARTING_TARGET -> VERIFYING_TARGET
+      -> STARTING_SOURCE_OBSERVER -> COMPLETE
 ```
 
 The control API performs these steps:
@@ -94,8 +95,10 @@ The control API performs these steps:
    acquires the next signer lease generation before it can sign.
 6. Verify the target owns the lease, proposes Mysticeti blocks, advances commit
    and checkpoint metrics, and has no key or committee mismatch.
-7. Mark the operation complete. Keep the old primary stopped and convert it to
-   the warm observer profile only after the new primary is healthy.
+7. Only after the target is verified, activate the old primary with its
+   independent observer profile. Mark the operation complete after that
+   observer process is running; it must become warm before a reverse promotion
+   is allowed.
 
 Rollback is another promotion in the opposite direction. It first fences the
 new primary and waits for its lease release or expiry; it never starts the old
