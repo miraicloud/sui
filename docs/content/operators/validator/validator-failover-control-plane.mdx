@@ -59,6 +59,8 @@ The comparison view must show at least:
 - checkpoint and commit lag relative to the primary and an independent Testnet
   endpoint;
 - protocol, worker, and network public-key fingerprints;
+- exact observer profile, validator profile, and validator network-key file
+  digests enforced by each host agent;
 - signer lease holder, generation, and signer-owned expiry;
 - voting right and current committee identity;
 - signer-owned randomness DKG status and whether shares are ready; and
@@ -118,7 +120,11 @@ agent:
   active-config-path: /etc/sui/active-node.yaml
   observer-config-path: /etc/sui/profiles/observer.yaml
   validator-config-path: /etc/sui/profiles/validator.yaml
+  validator-network-key-path: /etc/sui/validator-keys/network.key
   state-path: /var/lib/sui-validator-agent/state.bcs
+  observer-profile-digest: "<BLAKE2b-256 digest of exact observer.yaml bytes>"
+  validator-profile-digest: "<BLAKE2b-256 digest of exact validator.yaml bytes>"
+  validator-network-key-digest: "<BLAKE2b-256 digest of exact network.key bytes>"
   protocol-public-key: "<192 lowercase hex characters>"
   worker-public-key: "<64 lowercase hex characters>"
   network-public-key: "<64 lowercase hex characters>"
@@ -180,6 +186,13 @@ hosts:
 The token file, controller state directory, and every client private key must
 be readable only by the control service account. The bearer token must contain
 at least 32 non-whitespace bytes.
+
+The agent verifies all three configured file digests at startup, on every
+status read, and immediately before a profile activation. A changed profile or
+network key therefore makes readiness fail closed. During preflight, the
+controller also reads the signer's public keys with its read-only identity and
+requires them to match the protocol and worker fingerprints reported by both
+agents.
 
 ## Control API sketch
 

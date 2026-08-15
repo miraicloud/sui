@@ -356,6 +356,7 @@
           ["Signer lease mapped", Boolean(source)],
           ["Distinct holder certificates", first?.expected_holder_id !== second?.expected_holder_id],
           ["Candidate identities agree", first?.status.protocol_public_key === second?.status.protocol_public_key && first?.status.worker_public_key === second?.status.worker_public_key && first?.status.network_public_key === second?.status.network_public_key],
+          ["Signer keys match candidates", first?.status.protocol_public_key === data.signer_public_keys.protocol_public_key && first?.status.worker_public_key === data.signer_public_keys.worker_public_key],
           ["Epochs aligned", first?.metrics.epoch === second?.metrics.epoch],
           ["Observer is subscribed", target?.metrics.observer_subscribed_batches > 0],
           ["DKG failure clear", !first?.metrics.dkg_failed && !second?.metrics.dkg_failed],

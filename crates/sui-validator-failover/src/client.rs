@@ -222,17 +222,29 @@ mod tests {
 
         let observer = directory.path().join("observer.yaml");
         let validator = directory.path().join("validator.yaml");
+        let network_key = directory.path().join("network.key");
         fs::write(&observer, "observer").unwrap();
         fs::write(&validator, "validator").unwrap();
+        fs::write(&network_key, "network-key-material").unwrap();
         let agent = Agent::open(
             AgentConfig {
                 host_id: "validator-a".to_owned(),
                 service_name: "sui-node.service".to_owned(),
                 systemctl_path: "/usr/bin/systemctl".into(),
                 active_config_path: directory.path().join("active.yaml"),
-                observer_config_path: observer,
-                validator_config_path: validator,
+                observer_config_path: observer.clone(),
+                validator_config_path: validator.clone(),
+                validator_network_key_path: network_key.clone(),
                 state_path: directory.path().join("agent.bcs"),
+                observer_profile_digest: hex::encode(Blake2b256::digest(
+                    fs::read(&observer).unwrap(),
+                )),
+                validator_profile_digest: hex::encode(Blake2b256::digest(
+                    fs::read(&validator).unwrap(),
+                )),
+                validator_network_key_digest: hex::encode(Blake2b256::digest(
+                    fs::read(&network_key).unwrap(),
+                )),
                 protocol_public_key: hex::encode([1; 96]),
                 worker_public_key: hex::encode([2; 32]),
                 network_public_key: hex::encode([3; 32]),

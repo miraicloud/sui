@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use serde::{Deserialize, Serialize};
 use sui_validator_signer::{
-    client::{ExternalSignerConfig, SignerRpcClient},
+    client::{ExternalSignerConfig, PublicKeys, SignerRpcClient},
     protocol::{HolderId, SignerStatus},
 };
 use thiserror::Error;
@@ -42,6 +42,7 @@ pub trait AgentControl: Send + Sync {
 
 #[async_trait]
 pub trait SignerControl: Send + Sync {
+    async fn public_keys(&self) -> anyhow::Result<PublicKeys>;
     async fn status(&self) -> anyhow::Result<SignerStatus>;
 }
 
@@ -100,6 +101,10 @@ impl RemoteSigner {
 
 #[async_trait]
 impl SignerControl for RemoteSigner {
+    async fn public_keys(&self) -> anyhow::Result<PublicKeys> {
+        Ok(self.client.lock().await.get_public_keys().await?)
+    }
+
     async fn status(&self) -> anyhow::Result<SignerStatus> {
         Ok(self.client.lock().await.get_status().await?)
     }
@@ -152,8 +157,24 @@ pub struct HostSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ControlSnapshot {
     pub hosts: Vec<HostSnapshot>,
+    pub signer_public_keys: SignerPublicKeys,
     pub signer: SignerStatus,
     pub active_operation: Option<PromotionRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SignerPublicKeys {
+    pub protocol_public_key: String,
+    pub worker_public_key: String,
+}
+
+impl From<PublicKeys> for SignerPublicKeys {
+    fn from(keys: PublicKeys) -> Self {
+        Self {
+            protocol_public_key: hex::encode(keys.protocol_bls12381),
+            worker_public_key: hex::encode(keys.worker_ed25519),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +295,16 @@ impl ControlPlane {
                 metrics,
             });
         }
-        let signer = self.signer.status().await.map_err(ControlError::Signer)?;
+        let (signer, signer_public_keys) = tokio::try_join!(
+            async { self.signer.status().await.map_err(ControlError::Signer) },
+            async {
+                self.signer
+                    .public_keys()
+                    .await
+                    .map(SignerPublicKeys::from)
+                    .map_err(ControlError::Signer)
+            }
+        )?;
         let state = self.state.lock().await;
         let active_operation = state
             .active_operation
@@ -283,6 +313,7 @@ impl ControlPlane {
             .cloned();
         Ok(ControlSnapshot {
             hosts,
+            signer_public_keys,
             signer,
             active_operation,
         })
@@ -428,7 +459,14 @@ impl ControlPlane {
         target: &HostControl,
         expected_generation: u64,
     ) -> Result<ValidatorMetrics, ControlError> {
-        let (source_status, target_status, source_metrics, target_metrics, signer_status) = tokio::try_join!(
+        let (
+            source_status,
+            target_status,
+            source_metrics,
+            target_metrics,
+            signer_status,
+            signer_public_keys,
+        ) = tokio::try_join!(
             async {
                 source
                     .agent
@@ -458,6 +496,12 @@ impl ControlPlane {
                     .map_err(|error| ControlError::Metrics(target.host_id.clone(), error))
             },
             async { self.signer.status().await.map_err(ControlError::Signer) },
+            async {
+                self.signer
+                    .public_keys()
+                    .await
+                    .map_err(ControlError::Signer)
+            },
         )?;
 
         require_service(&source_status, NodeProfile::Validator, ServiceState::Active)?;
@@ -467,6 +511,11 @@ impl ControlPlane {
             || source_status.network_public_key != target_status.network_public_key
         {
             return Err(ControlError::IdentityMismatch);
+        }
+        if source_status.protocol_public_key != hex::encode(signer_public_keys.protocol_bls12381)
+            || source_status.worker_public_key != hex::encode(signer_public_keys.worker_ed25519)
+        {
+            return Err(ControlError::SignerIdentityMismatch);
         }
         if source_metrics.epoch != target_metrics.epoch {
             return Err(ControlError::EpochMismatch {
@@ -700,6 +749,8 @@ pub enum ControlError {
     },
     #[error("candidate validator key fingerprints differ")]
     IdentityMismatch,
+    #[error("candidate protocol or worker identity does not match the external signer")]
+    SignerIdentityMismatch,
     #[error("candidate epochs differ: source {source_epoch}, target {target_epoch}")]
     EpochMismatch {
         source_epoch: u64,
@@ -763,6 +814,7 @@ mod tests {
         hosts: StdMutex<BTreeMap<String, HostStatus>>,
         metrics: StdMutex<BTreeMap<String, ValidatorMetrics>>,
         signer: StdMutex<SignerStatus>,
+        signer_public_keys: StdMutex<PublicKeys>,
         events: StdMutex<Vec<String>>,
         release_source_lease: bool,
         target_holder: HolderId,
@@ -845,6 +897,10 @@ mod tests {
 
     #[async_trait]
     impl SignerControl for MockSigner {
+        async fn public_keys(&self) -> anyhow::Result<PublicKeys> {
+            Ok(self.0.signer_public_keys.lock().unwrap().clone())
+        }
+
         async fn status(&self) -> anyhow::Result<SignerStatus> {
             Ok(self.0.signer.lock().unwrap().clone())
         }
@@ -915,6 +971,10 @@ mod tests {
                     shares_ready: true,
                 }],
             }),
+            signer_public_keys: StdMutex::new(PublicKeys {
+                protocol_bls12381: vec![1; 96],
+                worker_ed25519: vec![2; 32],
+            }),
             events: StdMutex::new(Vec::new()),
             release_source_lease,
             target_holder,
@@ -972,6 +1032,10 @@ mod tests {
         assert_eq!(
             snapshot.hosts[0].expected_holder_id,
             hex::encode(source_holder)
+        );
+        assert_eq!(
+            snapshot.signer_public_keys.protocol_public_key,
+            hex::encode([1; 96])
         );
         assert!(snapshot.active_operation.is_none());
         assert!(shared.events.lock().unwrap().is_empty());
@@ -1034,6 +1098,24 @@ mod tests {
                 )
                 .await,
             Err(ControlError::IdentityMismatch)
+        ));
+        assert!(shared.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn signer_identity_mismatch_prevents_any_mutation() {
+        let (_directory, control, shared, _source_holder, _target_holder) = setup(true);
+        shared.signer_public_keys.lock().unwrap().worker_ed25519 = vec![9; 32];
+        assert!(matches!(
+            control
+                .promote(
+                    "drill-signer-mismatch".to_owned(),
+                    "source".to_owned(),
+                    "target".to_owned(),
+                    1,
+                )
+                .await,
+            Err(ControlError::SignerIdentityMismatch)
         ));
         assert!(shared.events.lock().unwrap().is_empty());
     }

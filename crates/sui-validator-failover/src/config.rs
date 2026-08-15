@@ -15,7 +15,11 @@ pub struct AgentConfig {
     pub active_config_path: PathBuf,
     pub observer_config_path: PathBuf,
     pub validator_config_path: PathBuf,
+    pub validator_network_key_path: PathBuf,
     pub state_path: PathBuf,
+    pub observer_profile_digest: String,
+    pub validator_profile_digest: String,
+    pub validator_network_key_digest: String,
     pub protocol_public_key: String,
     pub worker_public_key: String,
     pub network_public_key: String,
@@ -89,6 +93,10 @@ impl AgentConfig {
             ("active-config-path", &self.active_config_path),
             ("observer-config-path", &self.observer_config_path),
             ("validator-config-path", &self.validator_config_path),
+            (
+                "validator-network-key-path",
+                &self.validator_network_key_path,
+            ),
             ("state-path", &self.state_path),
         ] {
             ensure!(path.is_absolute(), "{name} must be absolute");
@@ -97,6 +105,17 @@ impl AgentConfig {
             self.observer_config_path != self.validator_config_path,
             "observer and validator profiles must differ"
         );
+        validate_hex_key("observer-profile-digest", &self.observer_profile_digest, 32)?;
+        validate_hex_key(
+            "validator-profile-digest",
+            &self.validator_profile_digest,
+            32,
+        )?;
+        validate_hex_key(
+            "validator-network-key-digest",
+            &self.validator_network_key_digest,
+            32,
+        )?;
         validate_hex_key("protocol-public-key", &self.protocol_public_key, 96)?;
         validate_hex_key("worker-public-key", &self.worker_public_key, 32)?;
         validate_hex_key("network-public-key", &self.network_public_key, 32)?;

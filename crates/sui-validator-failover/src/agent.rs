@@ -119,8 +119,7 @@ pub struct Agent<S: Supervisor> {
 impl<S: Supervisor> Agent<S> {
     pub fn open(config: AgentConfig, supervisor: S) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::InvalidConfig)?;
-        validate_profile_file(&config.observer_config_path)?;
-        validate_profile_file(&config.validator_config_path)?;
+        validate_artifacts(&config)?;
         let state = load_state(&config.state_path)?.unwrap_or_default();
         if state.version != STATE_VERSION {
             return Err(AgentError::UnsupportedStateVersion(state.version));
@@ -227,6 +226,7 @@ impl<S: Supervisor> Agent<S> {
     }
 
     fn status_with_state(&self, state: &PersistedAgentState) -> Result<HostStatus, AgentError> {
+        validate_artifacts(&self.config)?;
         let operation = state.current_operation.as_ref().and_then(|operation_id| {
             state
                 .operations
@@ -268,7 +268,7 @@ impl<S: Supervisor> Agent<S> {
             NodeProfile::Observer => &self.config.observer_config_path,
             NodeProfile::Validator => &self.config.validator_config_path,
         };
-        validate_profile_file(target)?;
+        validate_artifacts(&self.config)?;
         if let Ok(metadata) = fs::symlink_metadata(&self.config.active_config_path)
             && !metadata.file_type().is_symlink()
         {
@@ -311,10 +311,40 @@ fn validate_operation_id(operation_id: &str) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn validate_profile_file(path: &Path) -> Result<(), AgentError> {
+fn validate_regular_file(path: &Path) -> Result<(), AgentError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        return Err(AgentError::InvalidProfileFile(path.to_owned()));
+        return Err(AgentError::InvalidArtifactFile(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_artifacts(config: &AgentConfig) -> Result<(), AgentError> {
+    validate_file_digest(
+        &config.observer_config_path,
+        &config.observer_profile_digest,
+    )?;
+    validate_file_digest(
+        &config.validator_config_path,
+        &config.validator_profile_digest,
+    )?;
+    validate_file_digest(
+        &config.validator_network_key_path,
+        &config.validator_network_key_digest,
+    )?;
+    Ok(())
+}
+
+fn validate_file_digest(path: &Path, expected: &str) -> Result<(), AgentError> {
+    validate_regular_file(path)?;
+    let bytes = fs::read(path)?;
+    let actual: [u8; 32] = Blake2b256::digest(&bytes).into();
+    let expected: [u8; 32] = hex::decode(expected)
+        .expect("validated file digest")
+        .try_into()
+        .expect("validated file digest length");
+    if actual != expected {
+        return Err(AgentError::FileDigestMismatch(path.to_owned()));
     }
     Ok(())
 }
@@ -393,8 +423,10 @@ pub enum AgentError {
     ActiveConfigNotSymlink(PathBuf),
     #[error("active config points to an unknown profile: {0}")]
     UnknownProfileTarget(PathBuf),
-    #[error("invalid profile file: {0}")]
-    InvalidProfileFile(PathBuf),
+    #[error("configured artifact is not a regular file: {0}")]
+    InvalidArtifactFile(PathBuf),
+    #[error("configured file digest does not match {0}")]
+    FileDigestMismatch(PathBuf),
     #[error("invalid state path: {0}")]
     InvalidStatePath(PathBuf),
     #[error("corrupt agent state: {0}")]
@@ -470,16 +502,22 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let observer = directory.path().join("observer.yaml");
         let validator = directory.path().join("validator.yaml");
+        let network_key = directory.path().join("network.key");
         fs::write(&observer, "observer").unwrap();
         fs::write(&validator, "validator").unwrap();
+        fs::write(&network_key, "network-key-material").unwrap();
         let config = AgentConfig {
             host_id: "validator-a".to_owned(),
             service_name: "sui-node.service".to_owned(),
             systemctl_path: "/usr/bin/systemctl".into(),
             active_config_path: directory.path().join("active.yaml"),
-            observer_config_path: observer,
-            validator_config_path: validator,
+            observer_config_path: observer.clone(),
+            validator_config_path: validator.clone(),
+            validator_network_key_path: network_key.clone(),
             state_path: directory.path().join("agent.bcs"),
+            observer_profile_digest: file_digest(&observer),
+            validator_profile_digest: file_digest(&validator),
+            validator_network_key_digest: file_digest(&network_key),
             protocol_public_key: hex::encode([1; 96]),
             worker_public_key: hex::encode([2; 32]),
             network_public_key: hex::encode([3; 32]),
@@ -492,6 +530,10 @@ mod tests {
         };
         let agent = Agent::open(config, supervisor.clone()).unwrap();
         (directory, agent, supervisor)
+    }
+
+    fn file_digest(path: &Path) -> String {
+        hex::encode(Blake2b256::digest(fs::read(path).unwrap()))
     }
 
     #[test]
@@ -542,6 +584,25 @@ mod tests {
         assert!(matches!(
             agent.activate("promote-003", NodeProfile::Validator),
             Err(AgentError::ServiceMustBeInactive(ServiceState::Active))
+        ));
+    }
+
+    #[test]
+    fn profile_or_network_key_tampering_fails_closed() {
+        let (directory, agent, _supervisor) = setup(false);
+        fs::write(directory.path().join("validator.yaml"), "tampered").unwrap();
+        assert!(matches!(
+            agent.status(),
+            Err(AgentError::FileDigestMismatch(path))
+                if path == directory.path().join("validator.yaml")
+        ));
+
+        let (directory, agent, _supervisor) = setup(false);
+        fs::write(directory.path().join("network.key"), "other-key").unwrap();
+        assert!(matches!(
+            agent.activate("promote-tampered", NodeProfile::Validator),
+            Err(AgentError::FileDigestMismatch(path))
+                if path == directory.path().join("network.key")
         ));
     }
 

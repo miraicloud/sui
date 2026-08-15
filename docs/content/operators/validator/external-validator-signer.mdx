@@ -201,8 +201,9 @@ external-validator-signer:
 The transport network key is still file-backed. Both candidates need the same
 on-chain network identity for an immediate handoff, but it is not a slashable
 signing key. Keep its file sealed and readable only by `sui-node`; the host
-agent must stop the source and verify signer lease fencing before starting the
-target. Externalizing TLS/network signing remains a separate hardening stage.
+agent pins its exact file digest, stops the source, and verifies signer lease
+fencing before starting the target. Externalizing TLS/network signing remains a
+separate hardening stage.
 
 `GET_STATUS` is mTLS-authenticated but does not require a lease. It reports the
 signer's own observation time, only an effective unexpired lease, the next
