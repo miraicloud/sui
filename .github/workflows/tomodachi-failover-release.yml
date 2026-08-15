@@ -1,0 +1,56 @@
+name: Build Tomodachi failover bundle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tomodachi-failover-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-x86-64:
+    name: Linux x86_64 release bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ runner.temp }}/tomodachi-target
+      OUTPUT_DIR: ${{ runner.temp }}/tomodachi-artifacts
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Install protoc
+        uses: taiki-e/install-action@88d897fbe3f79ed72a43e0dcbca36156ff03344e # pin@v2.67.14
+        with:
+          tool: protoc
+
+      - name: Build reproducible release bundle
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          output="$OUTPUT_DIR/tomodachi-sui-failover-${GITHUB_SHA::12}-x86_64-linux.tar.gz"
+          crates/sui-validator-failover/deploy/build-release-bundle.sh "$output"
+          crates/sui-validator-failover/deploy/verify-release-bundle.sh "$output"
+          sha256sum "$output" > "$output.sha256"
+          df -h /
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # pin@v6.0.0
+        with:
+          name: tomodachi-sui-failover-${{ github.sha }}-x86_64-linux
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/tomodachi-artifacts/*.tar.gz
+            ${{ runner.temp }}/tomodachi-artifacts/*.sha256
