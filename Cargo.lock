@@ -17625,6 +17625,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.3",
  "bcs",
  "clap",
  "fastcrypto",
@@ -17635,6 +17636,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml 0.8.26",
  "sui-validator-signer",
  "telemetry-subscribers",

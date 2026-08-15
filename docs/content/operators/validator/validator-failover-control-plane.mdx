@@ -15,34 +15,39 @@ the web application, is the single-active safety authority.
 ## Components
 
 ```text
-                         read metrics and status
-                  +--------------------------------+
-                  |                                v
-            +-----+------+                  +------+------+
- operator ->| control API |----------------->|  dashboard  |
-            +-----+------+                  +-------------+
-                  |
-          authenticated commands
-          +-------+---------+
-          |                 |
-          v                 v
- +--------+--------+ +------+----------+
- | primary agent   | | backup agent    |
- | sui-node active | | observer warm   |
- +--------+--------+ +------+----------+
-          |                 |
-          +--------+--------+
-                   v
-        +----------+-----------+
-        | external signer      |
-        | one lease generation |
-        | durable decisions    |
-        +----------------------+
+            +-------------+       same-origin       +-------------+
+ operator ->|  dashboard  |------------------------>| control API |
+            +-------------+     bearer token        +-------------+
+                                                           | server-held mTLS
+                                  +------------------------+------------------+
+                                  |                        |                  |
+                                  v                        v                  v
+                         +--------+--------+      +--------+--------+  +------+-------+
+                         | primary agent   |      | backup agent    |  | signer status|
+                         | sui-node active |      | observer warm   |  | read-only cert|
+                         +--------+--------+      +--------+--------+  +------+-------+
+                                  |                        |                  |
+                                  +------------------------+------------------+
+                                                           v
+                                                +----------+-----------+
+                                                | external signer      |
+                                                | one lease generation |
+                                                | durable decisions    |
+                                                +----------------------+
 ```
 
-The dashboard reads Sui metrics from both nodes, signer status over mutually
-authenticated TLS, and supervisor status from a small host agent. The host
-agent exposes a narrow allowlist of operations; it is not a remote shell.
+The browser-rendered dashboard calls only the same-origin control API. The
+server reads Sui metrics from both nodes, signer status over mutually
+authenticated TLS, and supervisor status from a small host agent. Signer and
+agent certificates never enter browser storage. The signer's own certificate
+allowlist enforces that the control identity can read status and public keys but
+cannot acquire a lease or sign. The host agent exposes a narrow allowlist of
+operations; it is not a remote shell.
+
+The first deployment binds the control API to loopback and reaches it through
+an SSH tunnel. The operator bearer token is stored only in browser
+`sessionStorage`; it authenticates an intent to the controller and is not a
+signer credential.
 
 ## Readiness view
 
@@ -94,23 +99,105 @@ Rollback is another promotion in the opposite direction. It first fences the
 new primary and waits for its lease release or expiry; it never starts the old
 primary as a shortcut.
 
+## Service configuration
+
+Run one `sui-validator-agent` on each validator candidate. Its controller
+client certificate allowlist is independent of the signer's lease-holder
+allowlist. The service name and all profile paths are fixed configuration, so
+the controller cannot supply an arbitrary unit or path:
+
+```yaml
+# /etc/sui/validator-agent.yaml on validator-a
+listen-address: "0.0.0.0:19001"
+authorized-client-certificate-digests:
+  - "<control service client certificate BLAKE2b-256 DER digest>"
+agent:
+  host-id: validator-a
+  service-name: sui-node.service
+  systemctl-path: /usr/bin/systemctl
+  active-config-path: /etc/sui/active-node.yaml
+  observer-config-path: /etc/sui/profiles/observer.yaml
+  validator-config-path: /etc/sui/profiles/validator.yaml
+  state-path: /var/lib/sui-validator-agent/state.bcs
+  protocol-public-key: "<192 lowercase hex characters>"
+  worker-public-key: "<64 lowercase hex characters>"
+  network-public-key: "<64 lowercase hex characters>"
+tls:
+  certificate-path: /etc/sui/agent-tls/server.crt
+  private-key-path: /etc/sui/agent-tls/server.key
+  client-ca-path: /etc/sui/agent-tls/client-ca.crt
+```
+
+The control service uses its dedicated status-reader certificate when it
+connects to the signer and its controller certificate when it connects to each
+agent. It refuses a non-loopback listen address:
+
+```yaml
+# /etc/sui/validator-control.yaml
+listen-address: "127.0.0.1:19100"
+state-path: /var/lib/sui-validator-control/state.bcs
+api-bearer-token-path: /etc/sui/validator-control/token
+max-checkpoint-lag: 5000
+max-commit-lag: 10000
+poll-interval-ms: 500
+handoff-timeout-ms: 90000
+metrics-timeout-ms: 2000
+signer:
+  endpoint: "https://validator-signer.internal:19000"
+  server-name: validator-signer.internal
+  ca-certificate-path: /etc/sui/control-tls/signer-ca.crt
+  client-certificate-path: /etc/sui/control-tls/status-reader.crt
+  client-private-key-path: /etc/sui/control-tls/status-reader.key
+  expected-protocol-public-key: "<192 lowercase hex characters>"
+  expected-worker-public-key: "<64 lowercase hex characters>"
+  request-timeout-ms: 1000
+  lease-ttl-ms: 5000
+hosts:
+  - host-id: validator-a
+    expected-holder-id: "<validator-a signer client certificate digest>"
+    metrics-url: "http://validator-a.internal:9184/metrics"
+    agent:
+      endpoint: "https://validator-a.internal:19001"
+      server-name: validator-a.internal
+      ca-certificate-path: /etc/sui/control-tls/agent-ca.crt
+      client-certificate-path: /etc/sui/control-tls/controller.crt
+      client-private-key-path: /etc/sui/control-tls/controller.key
+      expected-host-id: validator-a
+      request-timeout-ms: 2000
+  - host-id: validator-b
+    expected-holder-id: "<validator-b signer client certificate digest>"
+    metrics-url: "http://validator-b.internal:9184/metrics"
+    agent:
+      endpoint: "https://validator-b.internal:19001"
+      server-name: validator-b.internal
+      ca-certificate-path: /etc/sui/control-tls/agent-ca.crt
+      client-certificate-path: /etc/sui/control-tls/controller.crt
+      client-private-key-path: /etc/sui/control-tls/controller.key
+      expected-host-id: validator-b
+      request-timeout-ms: 2000
+```
+
+The token file, controller state directory, and every client private key must
+be readable only by the control service account. The bearer token must contain
+at least 32 non-whitespace bytes.
+
 ## Control API sketch
 
 The initial API is deliberately small:
 
 ```text
-GET  /v1/validators
-GET  /v1/validators/{host}/readiness
-GET  /v1/signer/status
-POST /v1/promotions
-GET  /v1/promotions/{operation_id}
-POST /v1/promotions/{operation_id}/cancel
+GET  /api/v1/overview
+POST /api/v1/promotions
+GET  /api/v1/promotions/{operation_id}
 ```
 
-Creating a promotion requires an idempotency key, the expected active host and
-lease generation, and an operator confirmation token. Cancellation is accepted
-only before the target acquires a lease. All mutating calls are authenticated,
-authorized, rate limited, and written to an append-only audit log.
+Creating a promotion requires an immutable operation ID, source and target host
+IDs, and the exact expected source lease generation. The dashboard additionally
+requires the operator to type the target host and acknowledge the stop/fence
+sequence. The server executes the operation as a background job and persists
+each safety phase, so an identical request can resume after a process restart.
+Cancellation and an append-only operator audit journal are release-gate work;
+the current controller never provides a force or fence-bypass operation.
 
 Automatic failover is out of scope for the first release. The first version
 provides excellent evidence and one deliberate promotion action. Automation can

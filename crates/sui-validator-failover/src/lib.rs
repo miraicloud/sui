@@ -4,7 +4,9 @@
 pub mod agent;
 pub mod client;
 pub mod config;
+pub mod control_config;
 pub mod controller;
+pub mod dashboard;
 pub mod metrics;
 pub mod protocol;
 pub mod rpc;

@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tomodachi Validator Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #0b0c0a;
+      --panel: #121411;
+      --panel-raised: #181b17;
+      --rule: #363b32;
+      --muted: #949b8d;
+      --paper: #eef2e8;
+      --lime: #c8ff3d;
+      --amber: #ffc247;
+      --red: #ff5b47;
+      --cyan: #66d9e8;
+      --mono: "SFMono-Regular", "Cascadia Mono", "Liberation Mono", monospace;
+      --condensed: "Arial Narrow", "Aptos Narrow", "Roboto Condensed", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      min-height: 100vh;
+      color: var(--paper);
+      background-color: var(--ink);
+      font-family: var(--mono);
+      font-size: 14px;
+    }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    .shell { width: min(1480px, calc(100% - 40px)); margin: 0 auto; padding: 28px 0 56px; }
+    .masthead {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: end;
+      border-top: 8px solid var(--lime);
+      border-bottom: 1px solid var(--rule);
+      padding: 19px 0 17px;
+    }
+    .eyebrow, .label, .stamp { text-transform: uppercase; letter-spacing: .13em; }
+    .eyebrow { color: var(--lime); font-size: 11px; margin-bottom: 8px; }
+    h1 {
+      margin: 0;
+      font-family: var(--condensed);
+      font-stretch: condensed;
+      font-size: clamp(32px, 5vw, 74px);
+      line-height: .88;
+      letter-spacing: -.045em;
+      text-transform: uppercase;
+    }
+    .mast-meta { text-align: right; line-height: 1.7; color: var(--muted); font-size: 11px; }
+    .mast-meta b { color: var(--paper); font-weight: 600; }
+    .channel {
+      display: grid;
+      grid-template-columns: 1fr 44px 1fr 44px 1fr;
+      align-items: center;
+      gap: 10px;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--rule);
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .channel span { border: 1px solid var(--rule); padding: 9px 11px; text-align: center; background: var(--panel); }
+    .channel i { height: 1px; background: var(--lime); position: relative; }
+    .channel i::after { content: ""; position: absolute; right: 0; top: -3px; border-left: 6px solid var(--lime); border-top: 3px solid transparent; border-bottom: 3px solid transparent; }
+    .authbar {
+      display: grid;
+      grid-template-columns: auto minmax(180px, 460px) auto 1fr;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      margin: 18px 0;
+      background: var(--panel);
+      border: 1px solid var(--rule);
+    }
+    .authbar label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+    input {
+      width: 100%;
+      color: var(--paper);
+      background: var(--ink);
+      border: 1px solid var(--rule);
+      border-radius: 0;
+      padding: 11px 12px;
+    }
+    .btn {
+      border: 1px solid var(--paper);
+      border-radius: 0;
+      background: transparent;
+      color: var(--paper);
+      padding: 10px 14px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-size: 11px;
+    }
+    .btn:hover { background: var(--paper); color: var(--ink); }
+    .btn-primary { border-color: var(--lime); background: var(--lime); color: var(--ink); font-weight: 800; }
+    .btn-primary:hover { background: transparent; color: var(--lime); }
+    .btn-danger { border-color: var(--red); color: var(--red); }
+    .btn-danger:hover { background: var(--red); color: var(--ink); }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .connection { justify-self: end; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px rgba(148,155,141,.12); }
+    .dot.ok { background: var(--lime); box-shadow: 0 0 0 3px rgba(200,255,61,.13); }
+    .dot.bad { background: var(--red); box-shadow: 0 0 0 3px rgba(255,91,71,.13); }
+    .alert { display: none; border: 1px solid var(--red); color: var(--red); padding: 12px 14px; margin-bottom: 18px; background: rgba(255,91,71,.06); }
+    .alert.visible { display: block; }
+    .topline { display: flex; justify-content: space-between; gap: 18px; align-items: baseline; margin: 32px 0 10px; }
+    h2 { margin: 0; font-family: var(--condensed); font-size: 20px; text-transform: uppercase; letter-spacing: .02em; }
+    .stamp { color: var(--muted); font-size: 10px; }
+    .operation {
+      display: none;
+      grid-template-columns: auto 1fr auto;
+      gap: 18px;
+      align-items: center;
+      padding: 13px 16px;
+      border: 1px solid var(--amber);
+      background: rgba(255,194,71,.06);
+      margin-bottom: 18px;
+    }
+    .operation.visible { display: grid; }
+    .operation strong { color: var(--amber); text-transform: uppercase; }
+    .hosts {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 124px minmax(0, 1fr);
+      border: 1px solid var(--rule);
+      background: var(--panel);
+    }
+    .host { min-width: 0; padding: 20px; }
+    .host:first-child { border-right: 1px solid var(--rule); }
+    .host:last-child { border-left: 1px solid var(--rule); }
+    .host-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-bottom: 17px; border-bottom: 1px solid var(--rule); }
+    .host-name { margin: 0; overflow-wrap: anywhere; font-family: var(--condensed); font-size: clamp(20px, 2.5vw, 34px); line-height: .96; }
+    .role { padding: 6px 8px; border: 1px solid var(--rule); color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .09em; white-space: nowrap; }
+    .role.validator { color: var(--lime); border-color: var(--lime); }
+    .role.observer { color: var(--cyan); border-color: var(--cyan); }
+    .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 16px; border-top: 1px solid var(--rule); border-left: 1px solid var(--rule); }
+    .metric { min-width: 0; min-height: 91px; padding: 12px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+    .metric .label { color: var(--muted); font-size: 9px; margin-bottom: 12px; }
+    .metric .value { font-family: var(--condensed); font-size: clamp(18px, 2.1vw, 30px); line-height: 1; overflow: hidden; text-overflow: ellipsis; }
+    .identity { margin-top: 15px; color: var(--muted); font-size: 10px; line-height: 1.7; }
+    .identity code { display: block; color: var(--paper); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .host-actions { display: flex; justify-content: flex-end; margin-top: 18px; }
+    .fence { display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 18px 10px; background: var(--ink); text-align: center; }
+    .fence .label { color: var(--muted); font-size: 9px; writing-mode: vertical-rl; transform: rotate(180deg); }
+    .fence-line { flex: 1; width: 1px; min-height: 70px; margin: 12px 0; background: var(--rule); position: relative; }
+    .fence-line::before { content: ""; position: absolute; left: -4px; top: 50%; width: 9px; height: 9px; border: 1px solid var(--lime); background: var(--ink); transform: rotate(45deg); }
+    .lease-gen { color: var(--lime); font-family: var(--condensed); font-size: 25px; line-height: 1; }
+    .lease-caption { color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: .08em; margin-top: 4px; }
+    .lower { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; margin-top: 18px; }
+    .panel { border: 1px solid var(--rule); background: var(--panel); padding: 18px; }
+    .panel h3 { margin: 0 0 15px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .11em; }
+    .checks { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+    .check { display: flex; align-items: center; gap: 9px; border: 1px solid var(--rule); padding: 10px; font-size: 11px; }
+    .check::before { content: ""; width: 7px; height: 7px; background: var(--muted); }
+    .check.ok::before { background: var(--lime); }
+    .check.warn::before { background: var(--amber); }
+    .check.bad::before { background: var(--red); }
+    .audit { color: var(--muted); line-height: 1.7; font-size: 11px; }
+    .audit strong { color: var(--paper); }
+    dialog { width: min(620px, calc(100% - 32px)); color: var(--paper); background: var(--panel-raised); border: 1px solid var(--red); padding: 0; box-shadow: 16px 16px 0 rgba(0,0,0,.5); }
+    dialog::backdrop { background: rgba(0,0,0,.82); }
+    .dialog-head { padding: 18px 20px; border-bottom: 1px solid var(--rule); }
+    .dialog-head .eyebrow { color: var(--red); }
+    .dialog-body { padding: 20px; }
+    .dialog-body p { color: var(--muted); line-height: 1.6; }
+    .dialog-body code { color: var(--lime); }
+    .dialog-body label:not(.ack) { display: block; margin: 18px 0 8px; color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .09em; }
+    .ack { display: flex; align-items: flex-start; gap: 10px; margin-top: 15px; color: var(--paper); font-size: 11px; line-height: 1.5; }
+    .ack input { width: auto; margin-top: 2px; accent-color: var(--red); }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; padding-top: 20px; }
+    .empty { grid-column: 1 / -1; padding: 70px 20px; color: var(--muted); text-align: center; }
+    @media (max-width: 880px) {
+      .shell { width: min(100% - 24px, 1480px); }
+      .masthead { grid-template-columns: 1fr; }
+      .mast-meta { text-align: left; }
+      .channel { grid-template-columns: 1fr; }
+      .channel i { display: none; }
+      .authbar { grid-template-columns: 1fr auto; }
+      .authbar label, .connection { grid-column: 1 / -1; justify-self: start; }
+      .hosts { grid-template-columns: 1fr; }
+      .host:first-child, .host:last-child { border: 0; }
+      .fence { min-height: 100px; flex-direction: row; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+      .fence .label { writing-mode: initial; transform: none; }
+      .fence-line { min-height: 1px; height: 1px; width: auto; margin: 0 14px; }
+      .lower { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 520px) {
+      .metrics, .checks { grid-template-columns: 1fr; }
+      .authbar { grid-template-columns: 1fr; }
+      .btn { width: 100%; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .dot, .btn { transition: color .12s linear, background-color .12s linear, border-color .12s linear; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div>
+        <div class="eyebrow">Tomodachi / Safety Control 01</div>
+        <h1>Validator<br>Handoff</h1>
+      </div>
+      <div class="mast-meta">
+        <div>CONTROL SURFACE <b>SERVER-SIDE</b></div>
+        <div>TRANSPORT <b>LOOPBACK ONLY</b></div>
+        <div>SIGNER ACCESS <b>READ-ONLY CERT</b></div>
+      </div>
+    </header>
+
+    <section class="channel" aria-label="Trust boundary">
+      <span>Browser / Bearer</span><i></i><span>Control service / Durable sequence</span><i></i><span>mTLS agents + signer status</span>
+    </section>
+
+    <form class="authbar" id="auth-form">
+      <label for="token">Control token</label>
+      <input id="token" type="password" autocomplete="current-password" placeholder="Stored in this tab only" required>
+      <button class="btn" type="submit">Connect</button>
+      <div class="connection"><span class="dot" id="connection-dot"></span><span id="connection-label">Disconnected</span></div>
+    </form>
+
+    <div class="alert" id="alert" role="alert"></div>
+    <section class="operation" id="operation" aria-live="polite"></section>
+
+    <div class="topline">
+      <h2>Candidate hosts</h2>
+      <div class="stamp" id="observed-at">No authenticated sample</div>
+    </div>
+    <section class="hosts" id="hosts"><div class="empty">Enter the control token to inspect the failover pair.</div></section>
+
+    <section class="lower">
+      <div class="panel">
+        <h3>Promotion interlocks</h3>
+        <div class="checks" id="checks">
+          <div class="check">Waiting for telemetry</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Trust statement</h3>
+        <div class="audit">
+          The browser cannot address a signer or host agent. It submits one intent to this same-origin service.
+          The service performs <strong>stop → lease fence → start → readiness proof</strong> using pinned mTLS identities.
+          The controller certificate is not authorized to acquire a signer lease or request a signature.
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <div class="dialog-head">
+      <div class="eyebrow">Destructive control action</div>
+      <h2 id="confirm-title">Confirm validator handoff</h2>
+    </div>
+    <form class="dialog-body" id="confirm-form">
+      <p>Source <code id="confirm-source"></code> will stop before target <code id="confirm-target"></code> is allowed to request signer generation <code id="confirm-generation"></code> or higher.</p>
+      <label for="target-confirmation">Type the target host exactly</label>
+      <input id="target-confirmation" autocomplete="off" required>
+      <label class="ack"><input id="fence-confirmation" type="checkbox" required><span>I understand the source will be stopped and the target will start only after the signer lease is fenced.</span></label>
+      <div class="dialog-actions">
+        <button class="btn" id="cancel-promotion" type="button">Cancel</button>
+        <button class="btn btn-danger" id="execute-promotion" type="submit" disabled>Execute handoff</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      "use strict";
+      const byId = (id) => document.getElementById(id);
+      const authForm = byId("auth-form");
+      const tokenInput = byId("token");
+      const hostsNode = byId("hosts");
+      const alertNode = byId("alert");
+      const operationNode = byId("operation");
+      const checksNode = byId("checks");
+      const dialog = byId("confirm-dialog");
+      const confirmationInput = byId("target-confirmation");
+      const fenceConfirmation = byId("fence-confirmation");
+      const executeButton = byId("execute-promotion");
+      let token = sessionStorage.getItem("validator-control-token") || "";
+      let snapshot = null;
+      let pending = null;
+      let timer = null;
+      tokenInput.value = token;
+
+      const escapeHtml = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+      const compact = (value, edge = 8) => {
+        const text = String(value ?? "—");
+        return text.length > edge * 2 + 1 ? `${text.slice(0, edge)}…${text.slice(-edge)}` : text;
+      };
+      const number = (value) => Number(value ?? 0).toLocaleString("en-US");
+      const api = async (path, options = {}) => {
+        const response = await fetch(path, {
+          ...options,
+          cache: "no-store",
+          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", ...(options.headers || {}) }
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || `Control API returned ${response.status}`);
+        return body;
+      };
+      const setConnection = (mode, label) => {
+        byId("connection-dot").className = `dot ${mode}`;
+        byId("connection-label").textContent = label;
+      };
+      const showError = (message = "") => {
+        alertNode.textContent = message;
+        alertNode.classList.toggle("visible", Boolean(message));
+      };
+      const leaseHost = (data) => {
+        const holder = data.signer.current_lease?.holder_id;
+        return data.hosts.find((host) => host.expected_holder_id === holder) || null;
+      };
+      const metric = (label, value) => `<div class="metric"><div class="label">${label}</div><div class="value">${escapeHtml(value)}</div></div>`;
+      const hostCard = (host, leaseOwner) => {
+        const status = host.status;
+        const metrics = host.metrics;
+        const role = status.profile || "stopped";
+        const service = typeof status.service_state === "string" ? status.service_state : "unknown";
+        const isLeaseOwner = leaseOwner?.host_id === host.host_id;
+        return `<article class="host">
+          <div class="host-head">
+            <div><div class="eyebrow">${isLeaseOwner ? "Signer lease holder" : "Standby candidate"}</div><h3 class="host-name">${escapeHtml(host.host_id)}</h3></div>
+            <span class="role ${escapeHtml(role)}">${escapeHtml(role)} / ${escapeHtml(service)}</span>
+          </div>
+          <div class="metrics">
+            ${metric("Epoch", number(metrics.epoch))}
+            ${metric("Voting right", number(metrics.voting_right))}
+            ${metric("Commit index", number(metrics.last_commit_index))}
+            ${metric("Checkpoint", number(metrics.last_executed_checkpoint))}
+            ${metric("Proposed blocks", number(metrics.proposed_blocks))}
+            ${metric("Observer batches", number(metrics.observer_subscribed_batches))}
+          </div>
+          <div class="identity">
+            HOLDER CERTIFICATE DIGEST<code title="${escapeHtml(host.expected_holder_id)}">${escapeHtml(compact(host.expected_holder_id, 12))}</code>
+            VALIDATOR NETWORK KEY<code title="${escapeHtml(status.network_public_key)}">${escapeHtml(compact(status.network_public_key, 12))}</code>
+          </div>
+          <div class="host-actions"><button class="btn btn-primary promote" data-target="${escapeHtml(host.host_id)}" ${role === "observer" && !snapshot.active_operation ? "" : "disabled"}>Promote this host</button></div>
+        </article>`;
+      };
+      const renderChecks = (data) => {
+        const [first, second] = data.hosts;
+        const source = leaseHost(data);
+        const target = data.hosts.find((host) => host.host_id !== source?.host_id);
+        const checks = [
+          ["Signer lease mapped", Boolean(source)],
+          ["Distinct holder certificates", first?.expected_holder_id !== second?.expected_holder_id],
+          ["Candidate identities agree", first?.status.protocol_public_key === second?.status.protocol_public_key && first?.status.worker_public_key === second?.status.worker_public_key && first?.status.network_public_key === second?.status.network_public_key],
+          ["Epochs aligned", first?.metrics.epoch === second?.metrics.epoch],
+          ["Observer is subscribed", target?.metrics.observer_subscribed_batches > 0],
+          ["DKG failure clear", !first?.metrics.dkg_failed && !second?.metrics.dkg_failed],
+          ["Randomness shares ready", data.signer.randomness_sessions?.some((item) => item.epoch === source?.metrics.epoch && item.shares_ready)],
+          ["Single voting host", data.hosts.filter((host) => host.metrics.voting_right > 0).length === 1]
+        ];
+        checksNode.innerHTML = checks.map(([label, ok]) => `<div class="check ${ok ? "ok" : "bad"}">${escapeHtml(label)}</div>`).join("");
+      };
+      const renderOperation = (data, view = null) => {
+        const operation = data.active_operation;
+        operationNode.classList.toggle("visible", Boolean(operation));
+        if (!operation) { operationNode.innerHTML = ""; return; }
+        const job = view?.job;
+        const failed = job?.state === "failed";
+        operationNode.innerHTML = `<strong>${failed ? "Handoff paused" : "Handoff in progress"}</strong><span>${escapeHtml(operation.source_host)} → ${escapeHtml(operation.target_host)} · ${escapeHtml(failed ? job.error : operation.phase)}</span>${failed ? `<button class="btn btn-danger" id="resume-operation">Resume safely</button>` : `<span>${escapeHtml(job?.state || operation.phase)}</span>`}`;
+        if (failed) byId("resume-operation").addEventListener("click", () => openRecordConfirmation(operation));
+      };
+      const render = (data) => {
+        snapshot = data;
+        const source = leaseHost(data);
+        const lease = data.signer.current_lease;
+        const cards = data.hosts.map((host) => hostCard(host, source));
+        hostsNode.innerHTML = `${cards[0] || ""}<aside class="fence"><div class="label">External signer fence</div><div class="fence-line"></div><div><div class="lease-gen">${lease ? `G${number(lease.generation)}` : "OPEN"}</div><div class="lease-caption">${source ? escapeHtml(compact(source.host_id, 10)) : "No live lease"}</div></div></aside>${cards[1] || ""}`;
+        renderChecks(data);
+        renderOperation(data);
+        byId("observed-at").textContent = `Signer sample ${new Date(data.signer.observed_at_unix_ms).toISOString()}`;
+        document.querySelectorAll(".promote").forEach((button) => button.addEventListener("click", () => openConfirmation(button.dataset.target)));
+      };
+      const refresh = async () => {
+        if (!token) return;
+        try {
+          const data = await api("/api/v1/overview");
+          render(data);
+          if (data.active_operation) {
+            const view = await api(`/api/v1/promotions/${encodeURIComponent(data.active_operation.operation_id)}`);
+            renderOperation(data, view);
+          }
+          setConnection("ok", "Authenticated / 5s polling");
+          showError();
+        } catch (error) {
+          setConnection("bad", "Control API unavailable");
+          showError(error.message);
+        }
+      };
+      const openConfirmation = (targetId) => {
+        const source = leaseHost(snapshot);
+        const target = snapshot.hosts.find((host) => host.host_id === targetId);
+        const generation = snapshot.signer.current_lease?.generation;
+        if (!source || !target || generation == null) { showError("Cannot resolve the active signer lease to a source host."); return; }
+        prepareConfirmation(source.host_id, target.host_id, generation, null);
+      };
+      const openRecordConfirmation = (record) => {
+        prepareConfirmation(record.source_host, record.target_host, record.expected_source_generation, record.operation_id);
+      };
+      const prepareConfirmation = (sourceId, targetId, generation, operationId) => {
+        pending = { source: { host_id: sourceId }, target: { host_id: targetId }, generation, operationId };
+        byId("confirm-source").textContent = sourceId;
+        byId("confirm-target").textContent = targetId;
+        byId("confirm-generation").textContent = `G${generation + 1}`;
+        confirmationInput.value = "";
+        fenceConfirmation.checked = false;
+        executeButton.disabled = true;
+        dialog.showModal();
+        confirmationInput.focus();
+      };
+      const validateConfirmation = () => {
+        executeButton.disabled = !pending || confirmationInput.value !== pending.target.host_id || !fenceConfirmation.checked;
+      };
+      authForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        token = tokenInput.value.trim();
+        sessionStorage.setItem("validator-control-token", token);
+        clearInterval(timer);
+        await refresh();
+        timer = setInterval(refresh, 5000);
+      });
+      confirmationInput.addEventListener("input", validateConfirmation);
+      fenceConfirmation.addEventListener("change", validateConfirmation);
+      byId("cancel-promotion").addEventListener("click", () => dialog.close());
+      byId("confirm-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (executeButton.disabled || !pending) return;
+        executeButton.disabled = true;
+        const operationId = pending.operationId || `handoff-${new Date().toISOString().replaceAll(/[^0-9]/g, "").slice(0, 14)}-${pending.target.host_id.replaceAll(/[^A-Za-z0-9_-]/g, "-").slice(0, 40)}`;
+        try {
+          await api("/api/v1/promotions", {
+            method: "POST",
+            body: JSON.stringify({
+              operation_id: operationId,
+              source_host: pending.source.host_id,
+              target_host: pending.target.host_id,
+              expected_source_generation: pending.generation
+            })
+          });
+          dialog.close();
+          showError();
+          await refresh();
+        } catch (error) {
+          showError(error.message);
+          dialog.close();
+        }
+      });
+      if (token) {
+        refresh();
+        timer = setInterval(refresh, 5000);
+      }
+    })();
+  </script>
+</body>
+</html>

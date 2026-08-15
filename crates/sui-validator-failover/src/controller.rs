@@ -141,6 +141,21 @@ pub struct HostControl {
     pub metrics: Arc<dyn MetricsSource>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostSnapshot {
+    pub host_id: String,
+    pub expected_holder_id: String,
+    pub status: HostStatus,
+    pub metrics: ValidatorMetrics,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlSnapshot {
+    pub hosts: Vec<HostSnapshot>,
+    pub signer: SignerStatus,
+    pub active_operation: Option<PromotionRecord>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ControllerRuntimeConfig {
     pub state_path: PathBuf,
@@ -233,6 +248,44 @@ impl ControlPlane {
             .operations
             .get(operation_id)
             .cloned()
+    }
+
+    pub async fn snapshot(&self) -> Result<ControlSnapshot, ControlError> {
+        let mut hosts = Vec::with_capacity(self.hosts.len());
+        for host in self.hosts.values() {
+            let (status, metrics) = tokio::try_join!(
+                async {
+                    host.agent
+                        .status()
+                        .await
+                        .map_err(|error| ControlError::Agent(host.host_id.clone(), error))
+                },
+                async {
+                    host.metrics
+                        .sample()
+                        .await
+                        .map_err(|error| ControlError::Metrics(host.host_id.clone(), error))
+                }
+            )?;
+            hosts.push(HostSnapshot {
+                host_id: host.host_id.clone(),
+                expected_holder_id: hex::encode(host.expected_holder_id),
+                status,
+                metrics,
+            });
+        }
+        let signer = self.signer.status().await.map_err(ControlError::Signer)?;
+        let state = self.state.lock().await;
+        let active_operation = state
+            .active_operation
+            .as_ref()
+            .and_then(|operation_id| state.operations.get(operation_id))
+            .cloned();
+        Ok(ControlSnapshot {
+            hosts,
+            signer,
+            active_operation,
+        })
     }
 
     pub async fn promote(
@@ -905,6 +958,23 @@ mod tests {
         )
         .unwrap();
         (directory, control, shared, source_holder, target_holder)
+    }
+
+    #[tokio::test]
+    async fn snapshot_maps_hosts_to_signer_identity_without_mutation() {
+        let (_directory, control, shared, source_holder, _target_holder) = setup(true);
+        let snapshot = control.snapshot().await.unwrap();
+        assert_eq!(snapshot.hosts.len(), 2);
+        assert_eq!(
+            snapshot.signer.current_lease.as_ref().unwrap().holder_id,
+            source_holder
+        );
+        assert_eq!(
+            snapshot.hosts[0].expected_holder_id,
+            hex::encode(source_holder)
+        );
+        assert!(snapshot.active_operation.is_none());
+        assert!(shared.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
