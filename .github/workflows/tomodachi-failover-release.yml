@@ -1,6 +1,9 @@
 name: Build Tomodachi failover bundle
 
 on:
+  push:
+    branches:
+      - tomodachi/external-validator-signer
   workflow_dispatch:
 
 permissions:
