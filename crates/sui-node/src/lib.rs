@@ -1673,7 +1673,15 @@ impl SuiNode {
 
         if node_role.runs_consensus() && epoch_store.randomness_state_enabled() {
             let authority_key_pair = if node_role.is_validator() {
-                Some(config.protocol_key_pair())
+                if config.external_validator_signer.is_some() {
+                    warn!(
+                        "external signer mode is observing randomness DKG without local shares; \
+                         this validator will not contribute randomness partial signatures"
+                    );
+                    None
+                } else {
+                    Some(config.protocol_key_pair())
+                }
             } else {
                 None
             };

@@ -152,3 +152,8 @@ contain.
 The fork is not ready for a live validator until all key-coverage stages and
 the failover test matrix pass. Partial externalization must not be presented as
 private-key isolation.
+
+During stage 2, an externally signed validator follows randomness DKG as an
+observer and does not contribute a DKG message or randomness partial
+signatures. This avoids reintroducing the local protocol secret, but reduces
+the committee's randomness fault margin and is not the final deployment mode.
