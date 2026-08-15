@@ -16351,6 +16351,7 @@ dependencies = [
  "sui-telemetry",
  "sui-tls",
  "sui-types",
+ "sui-validator-signer",
  "tap",
  "telemetry-subscribers",
  "tempfile",

@@ -17,11 +17,14 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 256;
 
-pub struct BlockingAuthoritySigner {
-    commands: mpsc::Sender<Command>,
+#[derive(Clone)]
+pub struct BlockingValidatorSigner {
+    commands: Option<mpsc::Sender<Command>>,
 }
 
-impl BlockingAuthoritySigner {
+pub type BlockingAuthoritySigner = BlockingValidatorSigner;
+
+impl BlockingValidatorSigner {
     pub fn connect(
         config: ExternalSignerConfig,
         chain_id: ChainId,
@@ -36,7 +39,9 @@ impl BlockingAuthoritySigner {
             .map_err(BlockingSignerError::Spawn)?;
 
         match startup_receiver.recv_timeout(startup_timeout) {
-            Ok(Ok(())) => Ok(Self { commands }),
+            Ok(Ok(())) => Ok(Self {
+                commands: Some(commands),
+            }),
             Ok(Err(message)) => Err(BlockingSignerError::Startup(message)),
             Err(std_mpsc::RecvTimeoutError::Timeout) => Err(BlockingSignerError::StartupTimeout),
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -45,12 +50,20 @@ impl BlockingAuthoritySigner {
         }
     }
 
+    /// Creates a signer handle for a non-validator process. It deliberately has no
+    /// remote lease and fails closed if any authority signing path reaches it.
+    pub fn standby() -> Self {
+        Self { commands: None }
+    }
+
     pub fn sign_authority(
         &self,
         payload: &[u8],
     ) -> Result<AuthoritySignature, BlockingSignerError> {
         let (sender, receiver) = std_mpsc::sync_channel(1);
         self.commands
+            .as_ref()
+            .ok_or(BlockingSignerError::Standby)?
             .blocking_send(Command::SignAuthority {
                 payload: payload.to_vec(),
                 response: sender,
@@ -63,7 +76,7 @@ impl BlockingAuthoritySigner {
     }
 }
 
-impl Signer<AuthoritySignature> for BlockingAuthoritySigner {
+impl Signer<AuthoritySignature> for BlockingValidatorSigner {
     fn sign(&self, message: &[u8]) -> AuthoritySignature {
         self.sign_authority(message)
             .unwrap_or_else(|error| panic!("external authority signer failed closed: {error}"))
@@ -168,6 +181,8 @@ async fn sign_authority(
 
 #[derive(Debug, Error)]
 pub enum BlockingSignerError {
+    #[error("external signer is in standby mode")]
+    Standby,
     #[error("failed to spawn external signer worker: {0}")]
     Spawn(std::io::Error),
     #[error("external signer startup failed: {0}")]
@@ -182,4 +197,18 @@ pub enum BlockingSignerError {
     Client(#[from] ClientError),
     #[error("external signer returned an invalid BLS signature: {0}")]
     InvalidSignature(fastcrypto::error::FastCryptoError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standby_signer_fails_closed_without_connecting() {
+        let signer = BlockingValidatorSigner::standby();
+        assert!(matches!(
+            signer.sign_authority(b"must not sign"),
+            Err(BlockingSignerError::Standby)
+        ));
+    }
 }

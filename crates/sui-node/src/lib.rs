@@ -30,11 +30,11 @@ use std::time::Duration;
 use sui_core::admission_queue::{
     AdmissionQueueContext, AdmissionQueueManager, AdmissionQueueMetrics,
 };
-use sui_core::authority::ExecutionEnv;
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTablesOptions;
 use sui_core::authority::backpressure::BackpressureManager;
 use sui_core::authority::epoch_start_configuration::EpochFlag;
 use sui_core::authority::execution_time_estimator::ExecutionTimeObserver;
+use sui_core::authority::{ExecutionEnv, StableSyncAuthoritySigner};
 use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
@@ -155,6 +155,7 @@ use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemState;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::supported_protocol_versions::SupportedProtocolVersions;
+use sui_validator_signer::blocking::BlockingValidatorSigner;
 use typed_store::DBMetrics;
 use typed_store::rocks::default_db_options;
 
@@ -259,6 +260,7 @@ const DEFAULT_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SuiNode {
     config: NodeConfig,
+    _external_validator_signer: Option<Arc<BlockingValidatorSigner>>,
     validator_components: Mutex<Option<ValidatorComponents>>,
     validator_promotion_guard: Mutex<Option<ValidatorPromotionGuard>>,
 
@@ -527,7 +529,6 @@ impl SuiNode {
 
         let genesis = config.genesis()?.clone();
 
-        let secret = Arc::pin(config.protocol_key_pair().copy());
         let genesis_committee = genesis.committee();
         let committee_store = Arc::new(CommitteeStore::new(
             config.db_path().join("epochs"),
@@ -681,6 +682,23 @@ impl SuiNode {
         }
 
         info!("created epoch store");
+
+        let (secret, external_validator_signer): (
+            StableSyncAuthoritySigner,
+            Option<Arc<BlockingValidatorSigner>>,
+        ) = match &config.external_validator_signer {
+            Some(signer_config) => {
+                let signer = if node_role.is_validator() {
+                    BlockingValidatorSigner::connect(signer_config.clone(), *chain_id.as_bytes())
+                        .context("failed to acquire external validator signer lease")?
+                } else {
+                    BlockingValidatorSigner::standby()
+                };
+                let handle = Arc::new(signer.clone());
+                (Arc::pin(signer), Some(handle))
+            }
+            None => (Arc::pin(config.protocol_key_pair().copy()), None),
+        };
 
         replay_log!(
             "Beginning replay run. Epoch: {:?}, Protocol config: {:?}",
@@ -1115,6 +1133,7 @@ impl SuiNode {
 
         let node = Self {
             config,
+            _external_validator_signer: external_validator_signer,
             validator_components: Mutex::new(validator_components),
             validator_promotion_guard: Mutex::new(validator_promotion_guard),
             http_servers,
