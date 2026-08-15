@@ -9,5 +9,6 @@ pub mod client;
 pub mod config;
 pub mod policy;
 pub mod protocol;
+pub mod randomness;
 pub mod rpc;
 pub mod service;

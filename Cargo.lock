@@ -17628,6 +17628,7 @@ dependencies = [
  "consensus-config",
  "consensus-core",
  "fastcrypto",
+ "fastcrypto-tbls",
  "hex",
  "prost 0.14.1",
  "rand 0.8.5",

@@ -20,6 +20,7 @@ clap.workspace = true
 consensus-config.workspace = true
 consensus-core.workspace = true
 fastcrypto.workspace = true
+fastcrypto-tbls.workspace = true
 hex.workspace = true
 prost.workspace = true
 rand.workspace = true
