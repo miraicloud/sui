@@ -254,6 +254,7 @@ enum RandomnessMessage {
         Option<RandomnessSignature>,
     ),
     MaybeIgnoreByzantinePeer(EpochId, PeerId),
+    GeneratedPartialSignatures(EpochId, RandomnessRound, Vec<RandomnessPartialSignature>),
     AdminGetPartialSignatures(RandomnessRound, oneshot::Sender<Vec<u8>>),
     AdminInjectPartialSignatures(
         AuthorityName,
@@ -294,6 +295,7 @@ struct RandomnessEventLoop {
             Arc<OnceCell<RandomnessSignature>>,
         ),
     >,
+    signing_tasks: BTreeMap<RandomnessRound, tokio::task::JoinHandle<()>>,
     round_request_time: BTreeMap<(EpochId, RandomnessRound), time::Instant>,
     future_epoch_partial_sigs: BTreeMap<(EpochId, RandomnessRound, PeerId), Vec<Vec<u8>>>,
     received_partial_sigs: BTreeMap<(RandomnessRound, PeerId), Vec<RandomnessPartialSignature>>,
@@ -356,6 +358,9 @@ impl RandomnessEventLoop {
             }
             RandomnessMessage::MaybeIgnoreByzantinePeer(epoch, peer_id) => {
                 self.maybe_ignore_byzantine_peer(epoch, peer_id)
+            }
+            RandomnessMessage::GeneratedPartialSignatures(epoch, round, partial_sigs) => {
+                self.generated_partial_signatures(epoch, round, partial_sigs)
             }
             RandomnessMessage::AdminGetPartialSignatures(round, tx) => {
                 self.admin_get_partial_signatures(round, tx)
@@ -431,6 +436,9 @@ impl RandomnessEventLoop {
                 .or_insert(round);
         }
         for (_, (task, _)) in std::mem::take(&mut self.send_tasks) {
+            task.abort();
+        }
+        for (_, task) in std::mem::take(&mut self.signing_tasks) {
             task.abort();
         }
         self.metrics.set_epoch(new_epoch);
@@ -521,6 +529,10 @@ impl RandomnessEventLoop {
                 task.abort();
             }
             self.send_tasks = self.send_tasks.split_off(&(round + 1));
+            for (_, task) in self.signing_tasks.iter().take_while(|(r, _)| **r <= round) {
+                task.abort();
+            }
+            self.signing_tasks = self.signing_tasks.split_off(&(round + 1));
             self.maybe_start_pending_tasks();
         }
 
@@ -932,67 +944,117 @@ impl RandomnessEventLoop {
             self.send_tasks
                 .last_key_value()
                 .map(|(r, _)| r.checked_add(1).unwrap())
+                .into_iter()
+                .chain(
+                    self.signing_tasks
+                        .last_key_value()
+                        .map(|(r, _)| r.checked_add(1).unwrap()),
+                )
+                .max()
                 .unwrap_or(RandomnessRound(0)),
         );
 
-        let mut rounds_to_aggregate = Vec::new();
         for round in start_round.0..=highest_requested_round.0 {
             let round = RandomnessRound(round);
 
-            if self.send_tasks.len() >= self.config.max_partial_sigs_concurrent_sends() {
+            if self.send_tasks.len() + self.signing_tasks.len()
+                >= self.config.max_partial_sigs_concurrent_sends()
+            {
                 break; // limit concurrent tasks
             }
 
-            let partial_sigs = match partial_signer.partial_sign(self.epoch, round) {
-                Ok(partial_sigs) => partial_sigs,
-                Err(error) => {
-                    error!(%error, "failed to generate local randomness partial signatures");
-                    break;
+            let epoch = self.epoch;
+            let retry_interval = self.config.partial_signature_retry_interval();
+            let mailbox_sender = self.mailbox_sender.clone();
+            let partial_signer = partial_signer.clone();
+            let task = spawn_monitored_task!(async move {
+                loop {
+                    let signer = partial_signer.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || signer.partial_sign(epoch, round))
+                            .await;
+                    match result {
+                        Ok(Ok(partial_sigs)) => {
+                            if let Some(sender) = mailbox_sender.upgrade() {
+                                let _ = sender
+                                    .send(RandomnessMessage::GeneratedPartialSignatures(
+                                        epoch,
+                                        round,
+                                        partial_sigs,
+                                    ))
+                                    .await;
+                            }
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            error!(%error, %epoch, %round, "failed to generate local randomness partial signatures; retrying");
+                        }
+                        Err(error) => {
+                            error!(%error, %epoch, %round, "randomness partial signer task failed; retrying");
+                        }
+                    }
+                    tokio::time::sleep(retry_interval).await;
                 }
-            };
-            let full_sig_cell = Arc::new(OnceCell::new());
-            self.send_tasks.entry(round).or_insert_with(|| {
-                let name = self.name;
-                let network = self.network.clone();
-                let retry_interval = self.config.partial_signature_retry_interval();
-                let metrics = self.metrics.clone();
-                let authority_info = self.authority_info.clone();
-                let epoch = self.epoch;
-                metrics.record_partial_signatures(round);
-                let full_sig_cell_clone = full_sig_cell.clone();
-
-                // Record own partial sigs.
-                if !self.completed_sigs.contains_key(&round) {
-                    self.received_partial_sigs
-                        .insert((round, self.network.peer_id()), partial_sigs.clone());
-                    rounds_to_aggregate.push((epoch, round));
-                }
-
-                debug!("sending partial sigs for epoch {epoch}, round {round}");
-                (
-                    spawn_monitored_task!(RandomnessEventLoop::send_signatures_task(
-                        name,
-                        network,
-                        retry_interval,
-                        metrics,
-                        authority_info,
-                        epoch,
-                        round,
-                        partial_sigs,
-                        full_sig_cell_clone,
-                    )),
-                    full_sig_cell,
-                )
             });
+            self.signing_tasks.insert(round, task);
         }
 
         self.update_rounds_pending_metric();
+    }
 
-        // After starting a round, we have generated our own partial sigs. Check if that's
-        // enough for us to aggregate already.
-        for (epoch, round) in rounds_to_aggregate {
-            self.maybe_aggregate_partial_signatures(epoch, round);
+    fn generated_partial_signatures(
+        &mut self,
+        epoch: EpochId,
+        round: RandomnessRound,
+        partial_sigs: Vec<RandomnessPartialSignature>,
+    ) {
+        self.signing_tasks.remove(&round);
+        if epoch != self.epoch
+            || self.completed_sigs.contains_key(&round)
+            || self
+                .highest_completed_round
+                .get(&epoch)
+                .is_some_and(|highest| round <= *highest)
+            || self
+                .highest_requested_round
+                .get(&epoch)
+                .is_none_or(|highest| round > *highest)
+        {
+            return;
         }
+
+        let full_sig_cell = Arc::new(OnceCell::new());
+        let name = self.name;
+        let network = self.network.clone();
+        let retry_interval = self.config.partial_signature_retry_interval();
+        let metrics = self.metrics.clone();
+        let authority_info = self.authority_info.clone();
+        metrics.record_partial_signatures(round);
+
+        self.received_partial_sigs
+            .insert((round, self.network.peer_id()), partial_sigs.clone());
+        debug!("sending partial sigs for epoch {epoch}, round {round}");
+        let full_sig_cell_clone = full_sig_cell.clone();
+        self.send_tasks.insert(
+            round,
+            (
+                spawn_monitored_task!(RandomnessEventLoop::send_signatures_task(
+                    name,
+                    network,
+                    retry_interval,
+                    metrics,
+                    authority_info,
+                    epoch,
+                    round,
+                    partial_sigs,
+                    full_sig_cell_clone,
+                )),
+                full_sig_cell,
+            ),
+        );
+
+        self.maybe_aggregate_partial_signatures(epoch, round);
+        self.maybe_start_pending_tasks();
     }
 
     #[allow(clippy::type_complexity)]
@@ -1113,18 +1175,24 @@ impl RandomnessEventLoop {
 
     fn admin_get_partial_signatures(&self, round: RandomnessRound, tx: oneshot::Sender<Vec<u8>>) {
         let partial_signer = if let Some(partial_signer) = &self.partial_signer {
-            partial_signer
+            partial_signer.clone()
         } else {
             let _ = tx.send(Vec::new()); // no error handling needed if receiver is already dropped
             return;
         };
-
-        let Ok(partial_sigs) = partial_signer.partial_sign(self.epoch, round) else {
-            let _ = tx.send(Vec::new());
-            return;
-        };
-        // no error handling needed if receiver is already dropped
-        let _ = tx.send(bcs::to_bytes(&partial_sigs).expect("serialization should not fail"));
+        let epoch = self.epoch;
+        spawn_monitored_task!(async move {
+            let partial_sigs =
+                tokio::task::spawn_blocking(move || partial_signer.partial_sign(epoch, round))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let response = partial_sigs
+                .and_then(|partial_sigs| bcs::to_bytes(&partial_sigs).ok())
+                .unwrap_or_default();
+            // no error handling needed if receiver is already dropped
+            let _ = tx.send(response);
+        });
     }
 
     fn admin_inject_partial_signatures(

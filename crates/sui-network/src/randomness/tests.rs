@@ -4,7 +4,14 @@
 use crate::{randomness::*, utils};
 use fastcrypto::{groups::bls12381, serde_helpers::ToFromByteArray};
 use fastcrypto_tbls::{mocked_dkg, nodes, tbls::Share, types::ThresholdBls12381MinSig};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use sui_macros::sim_test;
 use sui_swarm_config::test_utils::CommitteeFixture;
 use sui_types::{
@@ -21,6 +28,137 @@ type EncG = bls12381::G2Element;
 struct TestExternalPartialSigner {
     epoch: EpochId,
     shares: Vec<Share<bls12381::Scalar>>,
+}
+
+#[derive(Debug)]
+struct InitiallyBlockedPartialSigner {
+    epoch: EpochId,
+    shares: Vec<Share<bls12381::Scalar>>,
+    attempts: AtomicUsize,
+    entered: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RandomnessPartialSigner for InitiallyBlockedPartialSigner {
+    fn partial_sign(
+        &self,
+        epoch: EpochId,
+        round: RandomnessRound,
+    ) -> anyhow::Result<Vec<RandomnessPartialSignature>> {
+        anyhow::ensure!(epoch == self.epoch);
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.store(true, Ordering::SeqCst);
+            let (lock, ready) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            anyhow::bail!("simulated external signer outage");
+        }
+        Ok(ThresholdBls12381MinSig::partial_sign_batch(
+            self.shares.iter(),
+            &round.signature_message(),
+        ))
+    }
+}
+
+#[sim_test]
+async fn test_external_signer_does_not_block_event_loop_and_retries() {
+    telemetry_subscribers::init_for_testing();
+    let committee_fixture = CommitteeFixture::generate(rand::rngs::OsRng, 0, 4);
+    let committee = committee_fixture.committee();
+    let (authority, _) = committee.members().next().unwrap();
+    let nodes = nodes::Nodes::new(
+        committee
+            .members()
+            .map(|(name, stake)| node_from_committee(committee, name, *stake))
+            .collect(),
+    )
+    .unwrap();
+
+    let (randomness_tx, _randomness_rx) = mpsc::channel(3);
+    let config = sui_config::p2p::RandomnessConfig {
+        partial_signature_retry_interval_ms: Some(10),
+        ..Default::default()
+    };
+    let (unstarted, router) = Builder::new(*authority, randomness_tx)
+        .config(config)
+        .build();
+    let network = utils::build_network(|router_builder| router_builder.merge(router));
+    let mut authority_info = HashMap::new();
+    for (index, (name, _)) in committee.members().enumerate() {
+        let peer_id = if name == authority {
+            network.peer_id()
+        } else {
+            anemo::PeerId([u8::try_from(index + 1).unwrap(); 32])
+        };
+        authority_info.insert(
+            *name,
+            (
+                peer_id,
+                committee.authority_index(name).unwrap().try_into().unwrap(),
+            ),
+        );
+    }
+    let mut dkg_output = mocked_dkg::generate_mocked_output::<PkG, EncG>(
+        nodes,
+        committee.validity_threshold().try_into().unwrap(),
+        0,
+        committee
+            .authority_index(authority)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let entered = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let signer = Arc::new(InitiallyBlockedPartialSigner {
+        epoch: 0,
+        shares: dkg_output.shares.take().unwrap(),
+        attempts: AtomicUsize::new(0),
+        entered: entered.clone(),
+        gate: gate.clone(),
+    });
+
+    let (event_loop, handle) = unstarted.build(network);
+    tokio::spawn(event_loop.start());
+    handle.update_epoch_with_signer(
+        0,
+        authority_info,
+        dkg_output,
+        committee.validity_threshold().try_into().unwrap(),
+        Some(signer.clone()),
+        None,
+    );
+    handle.send_partial_signatures(0, RandomnessRound(0));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // This mailbox operation must complete while the signing call is blocked on another thread.
+    let (result_tx, result_rx) = oneshot::channel();
+    handle.admin_inject_partial_signatures(*authority, RandomnessRound(0), Vec::new(), result_tx);
+    tokio::time::timeout(Duration::from_secs(1), result_rx)
+        .await
+        .expect("randomness event loop was blocked by the external signer")
+        .unwrap()
+        .unwrap();
+
+    let (lock, ready) = &*gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while signer.attempts.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("external signer failure was not retried");
 }
 
 impl RandomnessPartialSigner for TestExternalPartialSigner {

@@ -137,6 +137,7 @@ impl UnstartedRandomness {
                 aggregation_threshold: 0,
                 highest_requested_round: BTreeMap::new(),
                 send_tasks: BTreeMap::new(),
+                signing_tasks: BTreeMap::new(),
                 round_request_time: BTreeMap::new(),
                 future_epoch_partial_sigs: BTreeMap::new(),
                 received_partial_sigs: BTreeMap::new(),
