@@ -8,7 +8,6 @@ use std::thread;
 use sui_config::NodeConfig;
 use sui_node::{SuiNode, SuiNodeHandle};
 use sui_types::base_types::ConciseableName;
-use sui_types::crypto::{AuthorityPublicKeyBytes, KeypairTraits};
 use telemetry_subscribers::get_global_telemetry_config;
 use tracing::{info, trace};
 
@@ -43,9 +42,7 @@ impl Container {
     pub async fn spawn(config: NodeConfig, runtime: RuntimeType) -> Self {
         let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
-        let name = AuthorityPublicKeyBytes::from(config.protocol_key_pair().public())
-            .concise()
-            .to_string();
+        let name = config.protocol_public_key().concise().to_string();
 
         let thread = thread::Builder::new().name(name).spawn(move || {
             let span = if get_global_telemetry_config()
@@ -58,7 +55,7 @@ impl Container {
                 Some(tracing::span!(
                     tracing::Level::INFO,
                     "node",
-                    name =% AuthorityPublicKeyBytes::from(config.protocol_key_pair().public()).concise(),
+                    name =% config.protocol_public_key().concise(),
                 ))
             };
 

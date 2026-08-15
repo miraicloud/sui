@@ -33,3 +33,12 @@ telemetry-subscribers.workspace = true
 
 [target.'cfg(msim)'.dependencies]
 sui-simulator.workspace = true
+
+[dev-dependencies]
+consensus-config.workspace = true
+fastcrypto.workspace = true
+hex.workspace = true
+rcgen = "0.13.1"
+sui-validator-signer.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true

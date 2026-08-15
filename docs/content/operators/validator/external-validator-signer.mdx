@@ -220,10 +220,19 @@ receives only a public DKG output; private shares remain in the signer across
 node restarts and lease transfer. Slow or unavailable signer calls run outside
 the randomness network event loop and retry without blocking its mailbox.
 
-Production-Testnet deployment remains gated on transport-key verification,
-two-node adversarial tests, packaging, and a rehearsed rollback. A replicated
-or HSM-backed signer is a later availability and key-hardening stage; it must
-preserve exactly the same single-lease and durable decision semantics.
+The external signing path is exercised by a real four-validator local Sui
+swarm. The remotely signed validator has unrelated decoy protocol and worker
+keys in its local configuration, advances checkpoints, crosses an epoch,
+completes signer-owned randomness DKG, restarts, acquires a higher lease
+generation, and resumes checkpoint execution. A separate networked control
+plane test proves that a stale source process cannot sign after a fenced
+handoff.
+
+Production-Testnet deployment remains gated on a two-real-node rehearsal,
+transport-key verification, pinned Linux artifacts, and a rehearsed rollback.
+A replicated or HSM-backed signer is a later availability and key-hardening
+stage; it must preserve exactly the same single-lease and durable decision
+semantics.
 
 The fork must not be used for a live validator merely because its individual
 signing paths compile. The complete failover test matrix is the release gate.

@@ -56,7 +56,12 @@ one `sui-node` with the validator profile and the other with the observer
 profile. Do not expose a second validator process merely to test the fence; use
 the staged controller drill and preserve the operation record.
 
+The real local Sui swarm test already exercises remote authority and worker
+signing, checkpoint progress, an epoch transition, signer-owned DKG, and a
+higher lease generation after restart. The networked controller test separately
+exercises mutual TLS, stop/fence/start ordering, and stale-holder rejection.
+
 The first live Testnet handoff remains gated on the two-real-node rehearsal,
-artifact manifest, rollback rehearsal, and explicit operator handling of the
-existing validator key migration. Never discover, copy, or relocate those
-private keys as an unattended deployment step.
+pinned Linux artifact manifest, rollback rehearsal, and explicit operator
+handling of the existing validator key migration. Never discover, copy, or
+relocate those private keys as an unattended deployment step.
