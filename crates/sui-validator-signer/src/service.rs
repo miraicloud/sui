@@ -13,6 +13,7 @@ use thiserror::Error;
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status};
 
 use crate::{
+    authority_payload::{AuthorityPayloadError, classify_authority_payload},
     policy::{FileStateStore, PolicyError, SignerPolicy, SystemClock},
     protocol::{
         ChainId, HolderId, LeaseCredential, OperationKey, Request, RequestV1, Response, ResponseV1,
@@ -124,6 +125,13 @@ impl SignerService {
         ) {
             return Err(ServiceError::TypedRandomnessOperationRequired);
         }
+        if matches!(
+            operation,
+            OperationKey::TransactionEffects { .. } | OperationKey::CheckpointSummary { .. }
+        ) && &classify_authority_payload(self.chain_id, payload)? != operation
+        {
+            return Err(ServiceError::AuthorityOperationMismatch);
+        }
         Ok(())
     }
 }
@@ -192,6 +200,10 @@ enum ServiceError {
     InvalidPayloadSize,
     #[error("DKG and randomness requests require the typed randomness API")]
     TypedRandomnessOperationRequired,
+    #[error("authority signing payload does not match its operation key")]
+    AuthorityOperationMismatch,
+    #[error(transparent)]
+    AuthorityPayload(#[from] AuthorityPayloadError),
     #[error("invalid signer request: {0}")]
     Decode(bcs::Error),
     #[error("failed to encode signer response: {0}")]
@@ -207,6 +219,8 @@ impl From<ServiceError> for Status {
             ServiceError::ChainMismatch
             | ServiceError::InvalidPayloadSize
             | ServiceError::TypedRandomnessOperationRequired
+            | ServiceError::AuthorityOperationMismatch
+            | ServiceError::AuthorityPayload(_)
             | ServiceError::Decode(_) => Status::invalid_argument(error.to_string()),
             ServiceError::Policy(
                 PolicyError::NoLease
@@ -239,9 +253,11 @@ impl From<ServiceError> for Status {
 mod tests {
     use consensus_config::{ProtocolKeySignature, ProtocolPublicKey};
     use fastcrypto::traits::{ToFromBytes as _, VerifyingKey as _};
+    use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
     use sui_types::crypto::{
         AuthorityPublicKey, NetworkKeyPair, get_authority_key_pair, get_key_pair,
     };
+    use sui_types::effects::{TransactionEffects, TransactionEffectsAPI as _};
     use tempfile::TempDir;
 
     use super::*;
@@ -354,7 +370,14 @@ mod tests {
         let fixture = Fixture::new();
         let holder_id = [1; 32];
         let credential = fixture.acquire(holder_id);
-        let payload = b"effects intent and epoch".to_vec();
+        let effects = TransactionEffects::default();
+        let transaction_digest = effects.transaction_digest().into_inner();
+        let mut payload = bcs::to_bytes(&IntentMessage::new(
+            Intent::sui_app(IntentScope::TransactionEffects),
+            effects,
+        ))
+        .unwrap();
+        payload.extend(bcs::to_bytes(&9_u64).unwrap());
         let signature = fixture
             .sign(
                 holder_id,
@@ -362,7 +385,7 @@ mod tests {
                 OperationKey::TransactionEffects {
                     chain_id: [7; 32],
                     epoch: 9,
-                    transaction_digest: [5; 32],
+                    transaction_digest,
                 },
                 payload.clone(),
             )
