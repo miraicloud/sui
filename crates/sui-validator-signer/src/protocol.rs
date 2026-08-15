@@ -12,6 +12,7 @@ pub type LeaseId = [u8; 32];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LeaseGrant {
+    pub holder_id: HolderId,
     pub generation: u64,
     pub lease_id: LeaseId,
     pub expires_at_unix_ms: u64,

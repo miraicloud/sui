@@ -37,4 +37,6 @@ tracing.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+rcgen = "0.13.1"
 tempfile = "3.3.0"
+tokio-stream.workspace = true

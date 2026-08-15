@@ -290,6 +290,7 @@ mod tests {
                 )
                 .unwrap();
             let Response::V1(ResponseV1::Lease(LeaseGrant {
+                holder_id,
                 generation,
                 lease_id,
                 ..

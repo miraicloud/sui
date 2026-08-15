@@ -149,6 +149,7 @@ struct LeaseRecord {
 impl LeaseRecord {
     fn grant(&self) -> LeaseGrant {
         LeaseGrant {
+            holder_id: self.holder_id,
             generation: self.generation,
             lease_id: self.lease_id,
             expires_at_unix_ms: self.expires_at_unix_ms,
@@ -434,6 +435,7 @@ mod tests {
     }
 
     fn credential(holder_id: HolderId, grant: &LeaseGrant) -> LeaseCredential {
+        assert_eq!(holder_id, grant.holder_id);
         LeaseCredential {
             holder_id,
             generation: grant.generation,
