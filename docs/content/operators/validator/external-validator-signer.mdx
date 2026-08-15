@@ -116,6 +116,13 @@ At minimum, protected keys include:
 The state transition and signature result are committed atomically. A process
 crash cannot leave a returned signature absent from the durable journal.
 
+The current journal is append-only: each lease update or new signing decision
+is length-delimited, checksummed, and fsynced before signing proceeds. Its write
+cost does not grow with the number of prior decisions. A torn or corrupt record
+prevents signer startup rather than being skipped. Operators must retain and
+back up this file; periodic authenticated compaction is planned before a
+long-lived production deployment.
+
 ## Node behavior
 
 File-backed signing remains the default for upstream-compatible

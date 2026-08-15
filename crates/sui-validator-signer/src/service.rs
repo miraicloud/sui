@@ -256,6 +256,9 @@ impl From<ServiceError> for Status {
                 PolicyError::ClockBeforeUnixEpoch
                 | PolicyError::ClockOverflow
                 | PolicyError::GenerationExhausted
+                | PolicyError::InvalidStateTransition
+                | PolicyError::CorruptJournal(_)
+                | PolicyError::JournalRecordTooLarge(_)
                 | PolicyError::SigningFailed(_)
                 | PolicyError::LockPoisoned
                 | PolicyError::UnsupportedStateVersion(_)

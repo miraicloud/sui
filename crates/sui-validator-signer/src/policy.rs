@@ -5,11 +5,12 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fastcrypto::hash::{Blake2b256, HashFunction};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,6 +18,8 @@ use thiserror::Error;
 use crate::protocol::{Digest, HolderId, LeaseCredential, LeaseGrant, LeaseId, OperationKey};
 
 const STATE_VERSION: u16 = 1;
+const JOURNAL_CHECKSUM_BYTES: usize = 32;
+const MAX_JOURNAL_RECORD_BYTES: usize = 1024 * 1024;
 
 pub trait Clock: Send + Sync + 'static {
     fn unix_ms(&self) -> Result<u64, PolicyError>;
@@ -36,7 +39,7 @@ impl Clock for SystemClock {
 
 pub trait StateStore: Send + Sync + 'static {
     fn load(&self) -> Result<Option<PersistedState>, PolicyError>;
-    fn save(&self, state: &PersistedState) -> Result<(), PolicyError>;
+    fn save(&self, update: &StateUpdate) -> Result<(), PolicyError>;
 }
 
 #[derive(Debug)]
@@ -47,13 +50,6 @@ pub struct FileStateStore {
 impl FileStateStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
-    }
-
-    fn temp_path(&self) -> PathBuf {
-        let mut suffix = [0; 8];
-        OsRng.fill_bytes(&mut suffix);
-        self.path
-            .with_extension(format!("new.{}", hex::encode(suffix)))
     }
 }
 
@@ -75,15 +71,39 @@ impl StateStore for FileStateStore {
                 return Err(PolicyError::InsecureStatePermissions(self.path.clone()));
             }
         }
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) => return Err(PolicyError::Io(error)),
-        };
-        let state = bcs::from_bytes(&bytes).map_err(PolicyError::Deserialize)?;
+        let bytes = fs::read(&self.path)?;
+        let mut state = PersistedState::default();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if bytes.len() - cursor < size_of::<u32>() {
+                return Err(PolicyError::CorruptJournal(self.path.clone()));
+            }
+            let length = u32::from_le_bytes(
+                bytes[cursor..cursor + size_of::<u32>()]
+                    .try_into()
+                    .expect("journal length slice has fixed size"),
+            ) as usize;
+            cursor += size_of::<u32>();
+            if length == 0
+                || length > MAX_JOURNAL_RECORD_BYTES
+                || bytes.len() - cursor < length + JOURNAL_CHECKSUM_BYTES
+            {
+                return Err(PolicyError::CorruptJournal(self.path.clone()));
+            }
+            let record = &bytes[cursor..cursor + length];
+            cursor += length;
+            let checksum = &bytes[cursor..cursor + JOURNAL_CHECKSUM_BYTES];
+            cursor += JOURNAL_CHECKSUM_BYTES;
+            if Blake2b256::digest(record).as_ref() != checksum {
+                return Err(PolicyError::CorruptJournal(self.path.clone()));
+            }
+            let update: StateUpdate = bcs::from_bytes(record).map_err(PolicyError::Deserialize)?;
+            apply_update(&mut state, update)?;
+        }
         Ok(Some(state))
     }
 
-    fn save(&self, state: &PersistedState) -> Result<(), PolicyError> {
+    fn save(&self, update: &StateUpdate) -> Result<(), PolicyError> {
         let parent = self
             .path
             .parent()
@@ -92,29 +112,58 @@ impl StateStore for FileStateStore {
             fs::create_dir_all(parent)?;
         }
 
-        let temp_path = self.temp_path();
-        let bytes = bcs::to_bytes(state).map_err(PolicyError::Serialize)?;
+        let existed = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(PolicyError::InvalidStateFile(self.path.clone()));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        return Err(PolicyError::InsecureStatePermissions(self.path.clone()));
+                    }
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(PolicyError::Io(error)),
+        };
+
+        let record = bcs::to_bytes(update).map_err(PolicyError::Serialize)?;
+        if record.is_empty() || record.len() > MAX_JOURNAL_RECORD_BYTES {
+            return Err(PolicyError::JournalRecordTooLarge(record.len()));
+        }
+        let length = u32::try_from(record.len())
+            .map_err(|_| PolicyError::JournalRecordTooLarge(record.len()))?;
+        let checksum = Blake2b256::digest(&record);
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
+        let mut file = options.open(&self.path)?;
+        file.write_all(&length.to_le_bytes())?;
+        file.write_all(&record)?;
+        file.write_all(checksum.as_ref())?;
         file.sync_all()?;
-        fs::rename(&temp_path, &self.path)?;
-        sync_parent(parent)?;
+        if !existed && let Some(parent) = parent {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 }
 
-fn sync_parent(parent: Option<&Path>) -> Result<(), PolicyError> {
-    if let Some(parent) = parent {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateUpdate {
+    version: u16,
+    next_generation: u64,
+    last_seen_unix_ms: u64,
+    current_lease: Option<LeaseRecord>,
+    decision: Option<(OperationKey, Digest)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,6 +212,33 @@ impl LeaseRecord {
     }
 }
 
+fn apply_update(state: &mut PersistedState, update: StateUpdate) -> Result<(), PolicyError> {
+    if update.version != STATE_VERSION {
+        return Err(PolicyError::UnsupportedStateVersion(update.version));
+    }
+    if update.next_generation < state.next_generation
+        || update.last_seen_unix_ms < state.last_seen_unix_ms
+    {
+        return Err(PolicyError::InvalidStateTransition);
+    }
+    if let Some((operation, digest)) = update.decision {
+        match state.decisions.get(&operation) {
+            Some(previous) if previous != &digest => {
+                return Err(PolicyError::InvalidStateTransition);
+            }
+            Some(_) => {}
+            None => {
+                state.decisions.insert(operation, digest);
+            }
+        }
+    }
+    state.version = update.version;
+    state.next_generation = update.next_generation;
+    state.last_seen_unix_ms = update.last_seen_unix_ms;
+    state.current_lease = update.current_lease;
+    Ok(())
+}
+
 pub struct SignerPolicy<S = FileStateStore, C = SystemClock> {
     store: S,
     clock: C,
@@ -195,9 +271,8 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
         let now = self.clock.unix_ms()?;
         let expires_at_unix_ms = now.checked_add(ttl_ms).ok_or(PolicyError::ClockOverflow)?;
         let mut state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
-        let mut next = state.clone();
-        observe_time(&mut next, now)?;
-        if let Some(lease) = &next.current_lease
+        validate_time(&state, now)?;
+        if let Some(lease) = &state.current_lease
             && lease.expires_at_unix_ms > now
         {
             return Err(PolicyError::LeaseHeld {
@@ -206,8 +281,8 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
             });
         }
 
-        let generation = next.next_generation;
-        next.next_generation = generation
+        let generation = state.next_generation;
+        let next_generation = generation
             .checked_add(1)
             .ok_or(PolicyError::GenerationExhausted)?;
         let mut lease_id = [0; 32];
@@ -218,9 +293,17 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
             lease_id,
             expires_at_unix_ms,
         };
-        next.current_lease = Some(lease.clone());
-        self.store.save(&next)?;
-        *state = next;
+        let update = StateUpdate {
+            version: state.version,
+            next_generation,
+            last_seen_unix_ms: now,
+            current_lease: Some(lease.clone()),
+            decision: None,
+        };
+        self.store.save(&update)?;
+        state.next_generation = next_generation;
+        state.last_seen_unix_ms = now;
+        state.current_lease = Some(lease.clone());
         Ok(lease.grant())
     }
 
@@ -233,25 +316,38 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
         let now = self.clock.unix_ms()?;
         let expires_at_unix_ms = now.checked_add(ttl_ms).ok_or(PolicyError::ClockOverflow)?;
         let mut state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
-        let mut next = state.clone();
-        observe_time(&mut next, now)?;
-        let lease = valid_lease_mut(&mut next, credential, now)?;
+        validate_time(&state, now)?;
+        let mut lease = valid_lease(&state, credential, now)?.clone();
         lease.expires_at_unix_ms = expires_at_unix_ms;
         let grant = lease.grant();
-        self.store.save(&next)?;
-        *state = next;
+        let update = StateUpdate {
+            version: state.version,
+            next_generation: state.next_generation,
+            last_seen_unix_ms: now,
+            current_lease: Some(lease.clone()),
+            decision: None,
+        };
+        self.store.save(&update)?;
+        state.last_seen_unix_ms = now;
+        state.current_lease = Some(lease);
         Ok(grant)
     }
 
     pub fn release(&self, credential: &LeaseCredential) -> Result<(), PolicyError> {
         let now = self.clock.unix_ms()?;
         let mut state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
-        let mut next = state.clone();
-        observe_time(&mut next, now)?;
-        valid_lease(&next, credential, now)?;
-        next.current_lease = None;
-        self.store.save(&next)?;
-        *state = next;
+        validate_time(&state, now)?;
+        valid_lease(&state, credential, now)?;
+        let update = StateUpdate {
+            version: state.version,
+            next_generation: state.next_generation,
+            last_seen_unix_ms: now,
+            current_lease: None,
+            decision: None,
+        };
+        self.store.save(&update)?;
+        state.last_seen_unix_ms = now;
+        state.current_lease = None;
         Ok(())
     }
 
@@ -267,21 +363,28 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
     {
         let now = self.clock.unix_ms()?;
         let mut state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
-        let mut next = state.clone();
-        observe_time(&mut next, now)?;
-        valid_lease(&next, credential, now)?;
+        validate_time(&state, now)?;
+        valid_lease(&state, credential, now)?;
 
-        match next.decisions.get(&operation) {
+        let new_decision = match state.decisions.get(&operation) {
             Some(previous_digest) if previous_digest != &payload_digest => {
                 return Err(PolicyError::Equivocation);
             }
-            Some(_) => {}
-            None => {
-                next.decisions.insert(operation, payload_digest);
-            }
+            Some(_) => None,
+            None => Some((operation.clone(), payload_digest)),
+        };
+        let update = StateUpdate {
+            version: state.version,
+            next_generation: state.next_generation,
+            last_seen_unix_ms: now,
+            current_lease: state.current_lease.clone(),
+            decision: new_decision.clone(),
+        };
+        self.store.save(&update)?;
+        state.last_seen_unix_ms = now;
+        if let Some((operation, digest)) = new_decision {
+            state.decisions.insert(operation, digest);
         }
-        self.store.save(&next)?;
-        *state = next;
 
         let result = execute().map_err(PolicyError::SigningFailed)?;
         let completed_at = self.clock.unix_ms()?;
@@ -300,11 +403,10 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
     }
 }
 
-fn observe_time(state: &mut PersistedState, now: u64) -> Result<(), PolicyError> {
+fn validate_time(state: &PersistedState, now: u64) -> Result<(), PolicyError> {
     if now < state.last_seen_unix_ms {
         return Err(PolicyError::ClockMovedBackwards);
     }
-    state.last_seen_unix_ms = now;
     Ok(())
 }
 
@@ -314,21 +416,6 @@ fn valid_lease<'a>(
     now: u64,
 ) -> Result<&'a LeaseRecord, PolicyError> {
     let lease = state.current_lease.as_ref().ok_or(PolicyError::NoLease)?;
-    if !lease.credential_matches(credential) {
-        return Err(PolicyError::StaleLease);
-    }
-    if lease.expires_at_unix_ms <= now {
-        return Err(PolicyError::LeaseExpired);
-    }
-    Ok(lease)
-}
-
-fn valid_lease_mut<'a>(
-    state: &'a mut PersistedState,
-    credential: &LeaseCredential,
-    now: u64,
-) -> Result<&'a mut LeaseRecord, PolicyError> {
-    let lease = state.current_lease.as_mut().ok_or(PolicyError::NoLease)?;
     if !lease.credential_matches(credential) {
         return Err(PolicyError::StaleLease);
     }
@@ -369,6 +456,12 @@ pub enum PolicyError {
     LockPoisoned,
     #[error("unsupported signer state version {0}")]
     UnsupportedStateVersion(u16),
+    #[error("signer journal contains a non-monotonic or conflicting state transition")]
+    InvalidStateTransition,
+    #[error("signer journal is corrupt or contains a torn record: {0}")]
+    CorruptJournal(PathBuf),
+    #[error("signer journal record is too large: {0} bytes")]
+    JournalRecordTooLarge(usize),
     #[error("signer state path is not a regular file: {0}")]
     InvalidStateFile(PathBuf),
     #[error("signer state file is accessible by group or other users: {0}")]
@@ -421,11 +514,13 @@ mod tests {
             Ok(self.state.lock().unwrap().clone())
         }
 
-        fn save(&self, state: &PersistedState) -> Result<(), PolicyError> {
+        fn save(&self, update: &StateUpdate) -> Result<(), PolicyError> {
             if self.fail_save.swap(false, Ordering::SeqCst) {
                 return Err(PolicyError::Io(std::io::Error::other("injected")));
             }
-            *self.state.lock().unwrap() = Some(state.clone());
+            let mut guard = self.state.lock().unwrap();
+            let state = guard.get_or_insert_with(PersistedState::default);
+            apply_update(state, update.clone())?;
             Ok(())
         }
     }
@@ -562,6 +657,53 @@ mod tests {
                 || Ok(vec![9])
             ),
             Err(PolicyError::Equivocation)
+        ));
+    }
+
+    #[test]
+    fn journal_appends_constant_size_decision_records() {
+        let directory = TempDir::new().unwrap();
+        let clock = TestClock::default();
+        clock.set(100);
+        let path = directory.path().join("state.bcs");
+        let policy = policy(&directory, clock);
+        let grant = policy.acquire(holder(1), 1_000).unwrap();
+        let credential = credential(holder(1), &grant);
+        let before = fs::metadata(&path).unwrap().len();
+
+        for round in 0..100 {
+            policy
+                .authorize_and_execute(&credential, block(round), [round as u8; 32], || Ok(vec![1]))
+                .unwrap();
+        }
+
+        let appended = fs::metadata(path).unwrap().len() - before;
+        assert!(
+            appended < 100 * 256,
+            "journal unexpectedly grew to {appended}"
+        );
+    }
+
+    #[test]
+    fn torn_journal_record_fails_closed() {
+        let directory = TempDir::new().unwrap();
+        let clock = TestClock::default();
+        clock.set(100);
+        let path = directory.path().join("state.bcs");
+        {
+            let policy = policy(&directory, clock.clone());
+            policy.acquire(holder(1), 100).unwrap();
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1, 2, 3])
+            .unwrap();
+
+        assert!(matches!(
+            SignerPolicy::open(FileStateStore::new(path), clock, MAX_TTL_MS),
+            Err(PolicyError::CorruptJournal(_))
         ));
     }
 
