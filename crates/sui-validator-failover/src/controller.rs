@@ -742,6 +742,26 @@ fn validate_preflight(
 ) -> Result<ValidatorMetrics, ControlError> {
     require_service(&source.status, NodeProfile::Validator, ServiceState::Active)?;
     require_service(&target.status, NodeProfile::Observer, ServiceState::Active)?;
+    for host in [source, target] {
+        if !host.status.health.clock_synchronized {
+            return Err(ControlError::ClockNotSynchronized(host.host_id.clone()));
+        }
+        if !host.status.health.database_path_accessible {
+            return Err(ControlError::DatabasePathUnavailable(host.host_id.clone()));
+        }
+        if !host.status.health.database_space_sufficient {
+            return Err(ControlError::InsufficientDatabaseSpace {
+                host: host.host_id.clone(),
+                available_bytes: host.status.health.database_available_bytes,
+            });
+        }
+        if !host.status.health.service_restarts_acceptable {
+            return Err(ControlError::ExcessiveServiceRestarts {
+                host: host.host_id.clone(),
+                restarts: host.status.health.service_restart_count,
+            });
+        }
+    }
     if source.status.protocol_public_key != target.status.protocol_public_key
         || source.status.worker_public_key != target.status.worker_public_key
         || source.status.network_public_key != target.status.network_public_key
@@ -918,6 +938,14 @@ pub enum ControlError {
     },
     #[error("candidate validator key fingerprints differ")]
     IdentityMismatch,
+    #[error("host {0} clock is not synchronized")]
+    ClockNotSynchronized(String),
+    #[error("host {0} database path is not accessible")]
+    DatabasePathUnavailable(String),
+    #[error("host {host} has only {available_bytes} bytes available for its database")]
+    InsufficientDatabaseSpace { host: String, available_bytes: u64 },
+    #[error("host {host} has {restarts} service restarts, exceeding policy")]
+    ExcessiveServiceRestarts { host: String, restarts: u64 },
     #[error("candidate protocol or worker identity does not match the external signer")]
     SignerIdentityMismatch,
     #[error("candidate epochs differ: source {source_epoch}, target {target_epoch}")]
@@ -977,7 +1005,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::protocol::OperationStatus;
+    use crate::protocol::{HostHealth, OperationStatus};
 
     struct Shared {
         hosts: StdMutex<BTreeMap<String, HostStatus>>,
@@ -1083,6 +1111,14 @@ mod tests {
             protocol_public_key: hex::encode([1; 96]),
             worker_public_key: hex::encode([2; 32]),
             network_public_key: hex::encode([3; 32]),
+            health: HostHealth {
+                clock_synchronized: true,
+                database_path_accessible: true,
+                database_available_bytes: 1_000_000,
+                database_space_sufficient: true,
+                service_restart_count: 0,
+                service_restarts_acceptable: true,
+            },
             operation: None::<OperationStatus>,
         }
     }
@@ -1316,6 +1352,43 @@ mod tests {
             Err(ControlError::SignerIdentityMismatch)
         ));
         assert!(shared.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unhealthy_host_disables_readiness_and_prevents_mutation() {
+        let (_directory, control, shared, _source_holder, _target_holder) = setup(true);
+        {
+            let mut hosts = shared.hosts.lock().unwrap();
+            let target = hosts.get_mut("target").unwrap();
+            target.health.database_available_bytes = 42;
+            target.health.database_space_sufficient = false;
+        }
+        let snapshot = control.snapshot().await.unwrap();
+        assert!(!snapshot.promotion_readiness.eligible);
+        assert!(
+            snapshot
+                .promotion_readiness
+                .blocker
+                .as_deref()
+                .unwrap()
+                .contains("only 42 bytes")
+        );
+        assert!(matches!(
+            control
+                .promote(
+                    "drill-unhealthy-target".to_owned(),
+                    "source".to_owned(),
+                    "target".to_owned(),
+                    1,
+                )
+                .await,
+            Err(ControlError::InsufficientDatabaseSpace {
+                available_bytes: 42,
+                ..
+            })
+        ));
+        assert!(shared.events.lock().unwrap().is_empty());
+        assert!(control.snapshot().await.unwrap().active_operation.is_none());
     }
 
     #[tokio::test]

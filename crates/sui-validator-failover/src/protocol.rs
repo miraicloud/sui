@@ -50,7 +50,18 @@ pub struct HostStatus {
     pub protocol_public_key: String,
     pub worker_public_key: String,
     pub network_public_key: String,
+    pub health: HostHealth,
     pub operation: Option<OperationStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostHealth {
+    pub clock_synchronized: bool,
+    pub database_path_accessible: bool,
+    pub database_available_bytes: u64,
+    pub database_space_sufficient: bool,
+    pub service_restart_count: u64,
+    pub service_restarts_acceptable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

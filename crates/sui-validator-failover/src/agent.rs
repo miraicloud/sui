@@ -12,12 +12,14 @@ use std::{
 
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use serde::{Deserialize, Serialize};
+use sysinfo::Disks;
 use thiserror::Error;
 
 use crate::{
     config::AgentConfig,
     protocol::{
-        AgentAction, HostStatus, NodeProfile, OperationPhase, OperationStatus, ServiceState,
+        AgentAction, HostHealth, HostStatus, NodeProfile, OperationPhase, OperationStatus,
+        ServiceState,
     },
 };
 
@@ -28,18 +30,37 @@ pub trait Supervisor: Send + Sync + 'static {
     fn status(&self) -> Result<ServiceState, AgentError>;
     fn stop(&self) -> Result<(), AgentError>;
     fn start(&self) -> Result<(), AgentError>;
+
+    fn health(&self) -> Result<HostHealth, AgentError> {
+        Ok(HostHealth {
+            clock_synchronized: true,
+            database_path_accessible: true,
+            database_available_bytes: u64::MAX,
+            database_space_sufficient: true,
+            service_restart_count: 0,
+            service_restarts_acceptable: true,
+        })
+    }
 }
 
 pub struct SystemdSupervisor {
     systemctl_path: PathBuf,
+    timedatectl_path: PathBuf,
     service_name: String,
+    database_path: PathBuf,
+    min_database_available_bytes: u64,
+    max_service_restarts: u64,
 }
 
 impl SystemdSupervisor {
     pub fn new(config: &AgentConfig) -> Self {
         Self {
             systemctl_path: config.systemctl_path.clone(),
+            timedatectl_path: config.timedatectl_path.clone(),
             service_name: config.service_name.clone(),
+            database_path: config.database_path.clone(),
+            min_database_available_bytes: config.min_database_available_bytes,
+            max_service_restarts: config.max_service_restarts,
         }
     }
 
@@ -55,6 +76,20 @@ impl SystemdSupervisor {
             });
         }
         Ok(())
+    }
+
+    fn systemd_property(&self, property: &str) -> Result<String, AgentError> {
+        let output = Command::new(&self.systemctl_path)
+            .args(["show", "--property", property, "--value"])
+            .arg(&self.service_name)
+            .output()?;
+        if !output.status.success() {
+            return Err(AgentError::SupervisorCommand {
+                action: format!("show {property}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 }
 
@@ -84,6 +119,44 @@ impl Supervisor for SystemdSupervisor {
 
     fn start(&self) -> Result<(), AgentError> {
         self.command("start")
+    }
+
+    fn health(&self) -> Result<HostHealth, AgentError> {
+        let clock = Command::new(&self.timedatectl_path)
+            .args(["show", "--property=NTPSynchronized", "--value"])
+            .output()?;
+        if !clock.status.success() {
+            return Err(AgentError::SupervisorCommand {
+                action: "read clock synchronization".to_owned(),
+                stderr: String::from_utf8_lossy(&clock.stderr).trim().to_owned(),
+            });
+        }
+        let clock_synchronized = String::from_utf8_lossy(&clock.stdout).trim() == "yes";
+        let metadata = fs::symlink_metadata(&self.database_path)?;
+        let database_path_accessible =
+            metadata.file_type().is_dir() && fs::read_dir(&self.database_path).is_ok();
+        let canonical_database = fs::canonicalize(&self.database_path)?;
+        let disks = Disks::new_with_refreshed_list();
+        let database_available_bytes = disks
+            .list()
+            .iter()
+            .filter(|disk| canonical_database.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().components().count())
+            .map(|disk| disk.available_space())
+            .ok_or_else(|| AgentError::DatabaseMountNotFound(self.database_path.clone()))?;
+        let service_restart_count = self
+            .systemd_property("NRestarts")?
+            .parse()
+            .map_err(|_| AgentError::InvalidSupervisorProperty("NRestarts"))?;
+        Ok(HostHealth {
+            clock_synchronized,
+            database_path_accessible,
+            database_available_bytes,
+            database_space_sufficient: database_available_bytes
+                >= self.min_database_available_bytes,
+            service_restart_count,
+            service_restarts_acceptable: service_restart_count <= self.max_service_restarts,
+        })
     }
 }
 
@@ -244,6 +317,7 @@ impl<S: Supervisor> Agent<S> {
             protocol_public_key: self.config.protocol_public_key.clone(),
             worker_public_key: self.config.worker_public_key.clone(),
             network_public_key: self.config.network_public_key.clone(),
+            health: self.supervisor.health()?,
             operation,
         })
     }
@@ -332,6 +406,12 @@ fn validate_artifacts(config: &AgentConfig) -> Result<(), AgentError> {
         &config.validator_network_key_path,
         &config.validator_network_key_digest,
     )?;
+    let database = fs::symlink_metadata(&config.database_path)?;
+    if !database.file_type().is_dir() {
+        return Err(AgentError::InvalidDatabaseDirectory(
+            config.database_path.clone(),
+        ));
+    }
     Ok(())
 }
 
@@ -427,6 +507,12 @@ pub enum AgentError {
     InvalidArtifactFile(PathBuf),
     #[error("configured file digest does not match {0}")]
     FileDigestMismatch(PathBuf),
+    #[error("configured database path is not a directory: {0}")]
+    InvalidDatabaseDirectory(PathBuf),
+    #[error("could not find a mounted filesystem for database path {0}")]
+    DatabaseMountNotFound(PathBuf),
+    #[error("systemd returned an invalid {0} property")]
+    InvalidSupervisorProperty(&'static str),
     #[error("invalid state path: {0}")]
     InvalidStatePath(PathBuf),
     #[error("corrupt agent state: {0}")]
@@ -510,11 +596,15 @@ mod tests {
             host_id: "validator-a".to_owned(),
             service_name: "sui-node.service".to_owned(),
             systemctl_path: "/usr/bin/systemctl".into(),
+            timedatectl_path: "/usr/bin/timedatectl".into(),
             active_config_path: directory.path().join("active.yaml"),
             observer_config_path: observer.clone(),
             validator_config_path: validator.clone(),
             validator_network_key_path: network_key.clone(),
+            database_path: directory.path().to_path_buf(),
             state_path: directory.path().join("agent.bcs"),
+            min_database_available_bytes: 1,
+            max_service_restarts: 3,
             observer_profile_digest: file_digest(&observer),
             validator_profile_digest: file_digest(&validator),
             validator_network_key_digest: file_digest(&network_key),

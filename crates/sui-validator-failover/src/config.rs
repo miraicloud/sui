@@ -12,11 +12,15 @@ pub struct AgentConfig {
     pub host_id: String,
     pub service_name: String,
     pub systemctl_path: PathBuf,
+    pub timedatectl_path: PathBuf,
     pub active_config_path: PathBuf,
     pub observer_config_path: PathBuf,
     pub validator_config_path: PathBuf,
     pub validator_network_key_path: PathBuf,
+    pub database_path: PathBuf,
     pub state_path: PathBuf,
+    pub min_database_available_bytes: u64,
+    pub max_service_restarts: u64,
     pub observer_profile_digest: String,
     pub validator_profile_digest: String,
     pub validator_network_key_digest: String,
@@ -90,6 +94,7 @@ impl AgentConfig {
         );
         for (name, path) in [
             ("systemctl-path", &self.systemctl_path),
+            ("timedatectl-path", &self.timedatectl_path),
             ("active-config-path", &self.active_config_path),
             ("observer-config-path", &self.observer_config_path),
             ("validator-config-path", &self.validator_config_path),
@@ -97,6 +102,7 @@ impl AgentConfig {
                 "validator-network-key-path",
                 &self.validator_network_key_path,
             ),
+            ("database-path", &self.database_path),
             ("state-path", &self.state_path),
         ] {
             ensure!(path.is_absolute(), "{name} must be absolute");
@@ -104,6 +110,10 @@ impl AgentConfig {
         ensure!(
             self.observer_config_path != self.validator_config_path,
             "observer and validator profiles must differ"
+        );
+        ensure!(
+            self.min_database_available_bytes > 0,
+            "min-database-available-bytes must be nonzero"
         );
         validate_hex_key("observer-profile-digest", &self.observer_profile_digest, 32)?;
         validate_hex_key(

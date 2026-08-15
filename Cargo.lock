@@ -17650,6 +17650,7 @@ dependencies = [
  "serde_yaml 0.8.26",
  "sui-types",
  "sui-validator-signer",
+ "sysinfo",
  "telemetry-subscribers",
  "tempfile",
  "thiserror 1.0.69",

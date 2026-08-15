@@ -124,11 +124,15 @@ agent:
   host-id: validator-a
   service-name: sui-node.service
   systemctl-path: /usr/bin/systemctl
+  timedatectl-path: /usr/bin/timedatectl
   active-config-path: /etc/sui/active-node.yaml
   observer-config-path: /etc/sui/profiles/observer.yaml
   validator-config-path: /etc/sui/profiles/validator.yaml
   validator-network-key-path: /etc/sui/validator-keys/network.key
+  database-path: /var/lib/sui/authorities_db
   state-path: /var/lib/sui-validator-agent/state.bcs
+  min-database-available-bytes: 107374182400
+  max-service-restarts: 3
   observer-profile-digest: "<BLAKE2b-256 digest of exact observer.yaml bytes>"
   validator-profile-digest: "<BLAKE2b-256 digest of exact validator.yaml bytes>"
   validator-network-key-digest: "<BLAKE2b-256 digest of exact network.key bytes>"
@@ -200,6 +204,12 @@ network key therefore makes readiness fail closed. During preflight, the
 controller also reads the signer's public keys with its read-only identity and
 requires them to match the protocol and worker fingerprints reported by both
 agents.
+
+Every agent status also samples `timedatectl`, the database filesystem's
+available bytes, database-path accessibility, and systemd's `NRestarts` for
+the pinned node unit. The controller rejects promotion when either clock is
+unsynchronized, either database path cannot be read, free space is below that
+host's configured minimum, or its restart count exceeds policy.
 
 ## Control API sketch
 

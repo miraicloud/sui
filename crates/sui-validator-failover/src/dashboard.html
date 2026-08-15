@@ -299,6 +299,7 @@
         return text.length > edge * 2 + 1 ? `${text.slice(0, edge)}…${text.slice(-edge)}` : text;
       };
       const number = (value) => Number(value ?? 0).toLocaleString("en-US");
+      const gibibytes = (value) => `${(Number(value ?? 0) / 1073741824).toFixed(1)} GiB`;
       const api = async (path, options = {}) => {
         const response = await fetch(path, {
           ...options,
@@ -341,6 +342,9 @@
             ${metric("Checkpoint", number(metrics.last_executed_checkpoint))}
             ${metric("Proposed blocks", number(metrics.proposed_blocks))}
             ${metric("Observer batches", number(metrics.observer_subscribed_batches))}
+            ${metric("Database free", gibibytes(status.health?.database_available_bytes))}
+            ${metric("Clock synchronized", status.health?.clock_synchronized ? "yes" : "NO")}
+            ${metric("Service restarts", number(status.health?.service_restart_count))}
           </div>
           <div class="identity">
             HOLDER CERTIFICATE DIGEST<code title="${escapeHtml(host.expected_holder_id)}">${escapeHtml(compact(host.expected_holder_id, 12))}</code>
@@ -361,6 +365,9 @@
           ["Candidate identities agree", first?.status.protocol_public_key === second?.status.protocol_public_key && first?.status.worker_public_key === second?.status.worker_public_key && first?.status.network_public_key === second?.status.network_public_key],
           ["Signer keys match candidates", first?.status.protocol_public_key === data.signer_public_keys.protocol_public_key && first?.status.worker_public_key === data.signer_public_keys.worker_public_key],
           ["Epochs aligned", first?.metrics.epoch === second?.metrics.epoch],
+          ["Host clocks synchronized", data.hosts.every((host) => host.status.health?.clock_synchronized)],
+          ["Database paths healthy", data.hosts.every((host) => host.status.health?.database_path_accessible && host.status.health?.database_space_sufficient)],
+          ["Restart counters within policy", data.hosts.every((host) => host.status.health?.service_restarts_acceptable)],
           ["Observer is subscribed", target?.metrics.observer_subscribed_batches > 0],
           ["DKG failure clear", !first?.metrics.dkg_failed && !second?.metrics.dkg_failed],
           ["Randomness shares ready", data.signer.randomness_sessions?.some((item) => item.epoch === source?.metrics.epoch && item.shares_ready)],

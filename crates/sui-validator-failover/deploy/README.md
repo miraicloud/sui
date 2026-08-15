@@ -53,6 +53,8 @@ Before installing the validator profiles, confirm:
   the same on-chain validator network identity;
 - each agent pins the exact observer profile, validator profile, and validator
   network-key file bytes;
+- each agent points at the real authority database, has a deliberate free-space
+  floor, and uses fixed `systemctl` and `timedatectl` paths;
 - the controller uses only the signer's status-reader certificate; and
 - signer and agent ports are reachable only across the operator's private
   network. The dashboard remains on loopback and is reached through SSH.
