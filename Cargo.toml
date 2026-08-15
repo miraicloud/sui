@@ -199,6 +199,7 @@ members = [
     "crates/sui-transaction-checks",
     "crates/sui-transactional-test-runner",
     "crates/sui-types",
+    "crates/sui-validator-failover",
     "crates/sui-validator-signer",
     "crates/sui-upgrade-compatibility-transactional-tests",
     "crates/sui-verifier-transactional-tests",
@@ -763,6 +764,7 @@ sui-transaction-builder = { path = "crates/sui-transaction-builder" }
 sui-transaction-checks = { path = "crates/sui-transaction-checks" }
 sui-transactional-test-runner = { path = "crates/sui-transactional-test-runner" }
 sui-types = { path = "crates/sui-types" }
+sui-validator-failover = { path = "crates/sui-validator-failover" }
 sui-validator-signer = { path = "crates/sui-validator-signer" }
 sui-upgrade-compatibility-transactional-tests = { path = "crates/sui-upgrade-compatibility-transactional-tests" }
 sui-verifier-transactional-tests = { path = "crates/sui-verifier-transactional-tests" }

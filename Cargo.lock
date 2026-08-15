@@ -17620,6 +17620,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-validator-failover"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bcs",
+ "fastcrypto",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_yaml 0.8.26",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "sui-validator-signer"
 version = "0.0.0"
 dependencies = [
