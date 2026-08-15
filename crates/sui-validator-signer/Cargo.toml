@@ -1,6 +1,6 @@
 [package]
 name = "sui-validator-signer"
-version = "0.0.0"
+version.workspace = true
 authors = ["Mysten Labs <build@mystenlabs.com>"]
 license = "Apache-2.0"
 publish = false
@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 bcs.workspace = true
+bin-version.workspace = true
 clap.workspace = true
 consensus-config.workspace = true
 consensus-core.workspace = true

@@ -1,0 +1,41 @@
+listen-address: "127.0.0.1:19100"
+state-path: /var/lib/sui-validator-control/state.bcs
+api-bearer-token-path: /etc/sui-validator-control/token
+max-checkpoint-lag: 5000
+max-commit-lag: 10000
+poll-interval-ms: 500
+handoff-timeout-ms: 90000
+metrics-timeout-ms: 2000
+signer:
+  endpoint: "https://validator-signer.internal:19000"
+  server-name: validator-signer.internal
+  ca-certificate-path: /etc/sui-validator-control/tls/signer-ca.crt
+  client-certificate-path: /etc/sui-validator-control/tls/status-reader.crt
+  client-private-key-path: /etc/sui-validator-control/tls/status-reader.key
+  expected-protocol-public-key: "<192 lowercase hex characters>"
+  expected-worker-public-key: "<64 lowercase hex characters>"
+  request-timeout-ms: 1000
+  lease-ttl-ms: 5000
+hosts:
+  - host-id: validator-a
+    expected-holder-id: "<validator-a signer client certificate digest>"
+    metrics-url: "http://validator-a.internal:9184/metrics"
+    agent:
+      endpoint: "https://validator-a.internal:19001"
+      server-name: validator-a.internal
+      ca-certificate-path: /etc/sui-validator-control/tls/agent-ca.crt
+      client-certificate-path: /etc/sui-validator-control/tls/controller.crt
+      client-private-key-path: /etc/sui-validator-control/tls/controller.key
+      expected-host-id: validator-a
+      request-timeout-ms: 2000
+  - host-id: validator-b
+    expected-holder-id: "<validator-b signer client certificate digest>"
+    metrics-url: "http://validator-b.internal:9184/metrics"
+    agent:
+      endpoint: "https://validator-b.internal:19001"
+      server-name: validator-b.internal
+      ca-certificate-path: /etc/sui-validator-control/tls/agent-ca.crt
+      client-certificate-path: /etc/sui-validator-control/tls/controller.crt
+      client-private-key-path: /etc/sui-validator-control/tls/controller.key
+      expected-host-id: validator-b
+      request-timeout-ms: 2000

@@ -1,0 +1,31 @@
+[Unit]
+Description=Tomodachi Sui validator host agent
+After=network-online.target systemd-user-sessions.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/opt/tomodachi/bin/sui-validator-agent --config-path /etc/sui/validator-agent.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/etc/sui /var/lib/sui-validator-agent /run/systemd
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

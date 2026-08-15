@@ -1,0 +1,22 @@
+listen-address: "0.0.0.0:19001"
+authorized-client-certificate-digests:
+  - "<control service client certificate BLAKE2b-256 DER digest>"
+agent:
+  host-id: "<validator-a>"
+  service-name: sui-node.service
+  systemctl-path: /usr/bin/systemctl
+  active-config-path: /etc/sui/active-node.yaml
+  observer-config-path: /etc/sui/profiles/observer.yaml
+  validator-config-path: /etc/sui/profiles/validator.yaml
+  validator-network-key-path: /etc/sui/validator-keys/network.key
+  state-path: /var/lib/sui-validator-agent/state.bcs
+  observer-profile-digest: "<BLAKE2b-256 digest of exact observer.yaml bytes>"
+  validator-profile-digest: "<BLAKE2b-256 digest of exact validator.yaml bytes>"
+  validator-network-key-digest: "<BLAKE2b-256 digest of exact network.key bytes>"
+  protocol-public-key: "<192 lowercase hex characters>"
+  worker-public-key: "<64 lowercase hex characters>"
+  network-public-key: "<64 lowercase hex characters>"
+tls:
+  certificate-path: /etc/sui/agent-tls/server.crt
+  private-key-path: /etc/sui/agent-tls/server.key
+  client-ca-path: /etc/sui/agent-tls/client-ca.crt

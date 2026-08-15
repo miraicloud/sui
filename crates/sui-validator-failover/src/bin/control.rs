@@ -16,8 +16,14 @@ use sui_validator_failover::{
 use sui_validator_signer::config::ensure_private_directory;
 use tracing::info;
 
+bin_version::bin_version!();
+
 #[derive(Debug, Parser)]
-#[command(rename_all = "kebab-case")]
+#[command(
+    name = env!("CARGO_BIN_NAME"),
+    rename_all = "kebab-case",
+    version = VERSION
+)]
 struct Args {
     #[arg(long)]
     config_path: PathBuf,
