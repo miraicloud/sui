@@ -216,3 +216,17 @@ Automatic failover is out of scope for the first release. The first version
 provides excellent evidence and one deliberate promotion action. Automation can
 be enabled only after repeated fire drills establish safe thresholds for lag,
 network partitions, slow shutdown, signer loss, and restart recovery.
+
+## Integration drill
+
+The `fenced_handoff` integration test starts real mutual-TLS signer and agent
+servers with separate source, target, status-reader, and controller
+certificates. It prepares signer-owned randomness shares, gives the source a
+live lease, and deliberately retains that source client while the controller
+performs a handoff. The target must acquire a strictly higher generation and
+advance validator metrics. A final signing attempt using the source's stale
+credential must receive `PermissionDenied` from the signer.
+
+This proves the networked stop/fence/start path and stale-holder rejection. It
+does not replace the release-gate drill with two real `sui-node` processes,
+Testnet traffic, process crashes, and an epoch transition.

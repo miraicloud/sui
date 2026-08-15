@@ -44,6 +44,9 @@ tracing.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+consensus-config.workspace = true
+fastcrypto-tbls.workspace = true
 rcgen = "0.13.1"
+sui-types.workspace = true
 tempfile = "3.3.0"
 tokio-stream.workspace = true
