@@ -11,6 +11,7 @@ use sui_validator_failover::{
     rpc::ValidatorAgentServer,
     service::AgentService,
 };
+use sui_validator_signer::config::ensure_private_directory;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 
@@ -25,6 +26,9 @@ bin_version::bin_version!();
 struct Args {
     #[arg(long)]
     config_path: PathBuf,
+    /// Validate pinned artifacts and TLS without invoking systemd or listening.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -36,6 +40,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AgentDaemonConfig::load(&args.config_path)?;
     ensure_private_file(&config.tls.private_key_path)?;
+    let state_directory = config
+        .agent
+        .state_path
+        .parent()
+        .context("agent state-path must have a parent directory")?;
+    ensure_private_directory(state_directory)?;
     let supervisor = SystemdSupervisor::new(&config.agent);
     let agent = Agent::open(config.agent.clone(), supervisor)?;
     let authorized_clients = config
@@ -71,6 +81,25 @@ async fn main() -> Result<()> {
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(certificate, private_key))
         .client_ca_root(Certificate::from_pem(client_ca));
+
+    if args.check_config {
+        Server::builder().tls_config(tls)?;
+        println!("configuration valid");
+        println!("host-id: {}", config.agent.host_id);
+        println!(
+            "observer-profile-digest: {}",
+            config.agent.observer_profile_digest
+        );
+        println!(
+            "validator-profile-digest: {}",
+            config.agent.validator_profile_digest
+        );
+        println!(
+            "validator-network-key-digest: {}",
+            config.agent.validator_network_key_digest
+        );
+        return Ok(());
+    }
 
     info!(
         host_id = %config.agent.host_id,

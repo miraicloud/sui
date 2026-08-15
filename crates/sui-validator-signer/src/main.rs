@@ -6,6 +6,7 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use consensus_config::ProtocolKeyPair;
+use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
 use sui_keys::keypair_file::{read_authority_keypair_from_file, read_network_keypair_from_file};
 use sui_validator_signer::{
     config::{SignerConfig, ensure_private_directory, ensure_private_file},
@@ -27,6 +28,9 @@ bin_version::bin_version!();
 struct Args {
     #[arg(long)]
     config_path: PathBuf,
+    /// Validate all local material without opening state or listening.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -64,23 +68,10 @@ async fn main() -> Result<()> {
             config.worker_key_path.display()
         )
     })?;
-    let policy = SignerPolicy::open(
-        FileStateStore::new(&config.state_path),
-        SystemClock,
-        config.max_lease_ttl_ms,
+    let access = SignerAccessPolicy::new(
+        config.authorized_lease_holders()?,
+        config.authorized_status_readers()?,
     )?;
-    let service = SignerService::new(
-        SignerAccessPolicy::new(
-            config.authorized_lease_holders()?,
-            config.authorized_status_readers()?,
-        )?,
-        policy,
-        SignerKeys::new(protocol, ProtocolKeyPair::new(worker)),
-        config.parsed_chain_id()?,
-        config.max_payload_bytes,
-        &config.randomness_state_path,
-    )?;
-
     let certificate = fs::read(&config.tls.certificate_path).with_context(|| {
         format!(
             "failed to read TLS certificate {}",
@@ -102,6 +93,33 @@ async fn main() -> Result<()> {
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(certificate, private_key))
         .client_ca_root(Certificate::from_pem(client_ca));
+    if args.check_config {
+        Server::builder().tls_config(tls)?;
+        println!("configuration valid");
+        println!("chain-id: {}", config.chain_id);
+        println!(
+            "protocol-public-key: {}",
+            hex::encode(protocol.public().as_bytes())
+        );
+        println!(
+            "worker-public-key: {}",
+            hex::encode(worker.public().as_bytes())
+        );
+        return Ok(());
+    }
+    let policy = SignerPolicy::open(
+        FileStateStore::new(&config.state_path),
+        SystemClock,
+        config.max_lease_ttl_ms,
+    )?;
+    let service = SignerService::new(
+        access,
+        policy,
+        SignerKeys::new(protocol, ProtocolKeyPair::new(worker)),
+        config.parsed_chain_id()?,
+        config.max_payload_bytes,
+        &config.randomness_state_path,
+    )?;
 
     info!(
         listen_address = %config.listen_address,

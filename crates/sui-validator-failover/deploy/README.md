@@ -62,6 +62,23 @@ one `sui-node` with the validator profile and the other with the observer
 profile. Do not expose a second validator process merely to test the fence; use
 the staged controller drill and preserve the operation record.
 
+The signer and agent units run a local, non-mutating configuration check before
+each start. After every service is reachable and the observer is warm, run the
+controller's end-to-end read-only preflight:
+
+```sh
+/opt/tomodachi/bin/sui-validator-control \
+  --config-path /etc/sui-validator-control/control.yaml \
+  --preflight
+```
+
+It queries both mTLS agents, both Sui metrics endpoints, and the signer with the
+status-reader certificate. It prints the same server-authoritative snapshot
+used by the dashboard and exits nonzero unless the exact source, target, signer
+lease generation, key identities, epoch, DKG state, voting roles, and lag bounds
+are eligible. It never calls a stop, start, profile activation, lease, or
+signing method.
+
 The real local Sui swarm test already exercises remote authority and worker
 signing, checkpoint progress, an epoch transition, signer-owned DKG, and a
 higher lease generation after restart. The networked controller test separately

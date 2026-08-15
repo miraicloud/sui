@@ -8,6 +8,7 @@ Type=simple
 User=sui-signer
 Group=sui-signer
 UMask=0077
+ExecStartPre=/opt/tomodachi/bin/sui-validator-signer --config-path /etc/sui-validator-signer/signer.yaml --check-config
 ExecStart=/opt/tomodachi/bin/sui-validator-signer --config-path /etc/sui-validator-signer/signer.yaml
 Restart=on-failure
 RestartSec=3

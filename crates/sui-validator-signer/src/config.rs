@@ -33,7 +33,7 @@ pub struct SignerConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TlsConfig {
     pub certificate_path: PathBuf,
     pub private_key_path: PathBuf,
@@ -55,8 +55,36 @@ impl SignerConfig {
             !config.lease_holder_certificate_digests.is_empty(),
             "at least one lease-holder certificate digest is required"
         );
-        config.authorized_lease_holders()?;
-        config.authorized_status_readers()?;
+        ensure!(
+            config.chain_id == config.chain_id.to_ascii_lowercase(),
+            "chain-id must be lowercase"
+        );
+        config.parsed_chain_id()?;
+        let lease_holders = config.authorized_lease_holders()?;
+        let status_readers = config.authorized_status_readers()?;
+        ensure!(
+            lease_holders.is_disjoint(&status_readers),
+            "lease-holder and status-reader certificate allowlists must be disjoint"
+        );
+        for (name, path) in [
+            ("state-path", &config.state_path),
+            ("randomness-state-path", &config.randomness_state_path),
+            ("protocol-key-path", &config.protocol_key_path),
+            ("worker-key-path", &config.worker_key_path),
+            ("tls.certificate-path", &config.tls.certificate_path),
+            ("tls.private-key-path", &config.tls.private_key_path),
+            ("tls.client-ca-path", &config.tls.client_ca_path),
+        ] {
+            ensure!(path.is_absolute(), "{name} must be absolute");
+        }
+        ensure!(
+            config.state_path != config.randomness_state_path,
+            "state-path and randomness-state-path must differ"
+        );
+        ensure!(
+            config.protocol_key_path != config.worker_key_path,
+            "protocol-key-path and worker-key-path must differ"
+        );
         Ok(config)
     }
 
@@ -149,4 +177,76 @@ pub fn ensure_private_directory(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn config_yaml(lease_holder: &str, status_reader: &str) -> String {
+        format!(
+            r#"
+listen-address: "127.0.0.1:19000"
+state-path: /var/lib/signer/policy.journal
+randomness-state-path: /var/lib/signer/randomness.bcs
+protocol-key-path: /etc/signer/protocol.key
+worker-key-path: /etc/signer/worker.key
+chain-id: "{chain_id}"
+lease-holder-certificate-digests:
+  - "{lease_holder}"
+status-reader-certificate-digests:
+  - "{status_reader}"
+tls:
+  certificate-path: /etc/signer/server.crt
+  private-key-path: /etc/signer/server.key
+  client-ca-path: /etc/signer/ca.crt
+"#,
+            chain_id = hex::encode([7; 32]),
+        )
+    }
+
+    fn load(yaml: &str) -> anyhow::Result<SignerConfig> {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("signer.yaml");
+        fs::write(&path, yaml).unwrap();
+        SignerConfig::load(&path)
+    }
+
+    #[test]
+    fn accepts_distinct_certificate_roles_and_absolute_paths() {
+        load(&config_yaml(&hex::encode([1; 32]), &hex::encode([2; 32]))).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_status_reader_that_can_also_sign() {
+        let identity = hex::encode([1; 32]);
+        assert!(
+            load(&config_yaml(&identity, &identity))
+                .unwrap_err()
+                .to_string()
+                .contains("must be disjoint")
+        );
+    }
+
+    #[test]
+    fn rejects_relative_key_paths_and_unknown_tls_fields() {
+        let valid = config_yaml(&hex::encode([1; 32]), &hex::encode([2; 32]));
+        assert!(
+            load(&valid.replace(
+                "protocol-key-path: /etc/signer/protocol.key",
+                "protocol-key-path: protocol.key"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("must be absolute")
+        );
+        assert!(
+            load(&valid.replace(
+                "  client-ca-path: /etc/signer/ca.crt",
+                "  client-ca-path: /etc/signer/ca.crt\n  unexpected: true"
+            ))
+            .is_err()
+        );
+    }
 }

@@ -3,7 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use sui_validator_failover::{
     control_config::ControllerDaemonConfig,
@@ -27,6 +27,9 @@ bin_version::bin_version!();
 struct Args {
     #[arg(long)]
     config_path: PathBuf,
+    /// Query both agents, both metrics endpoints, and the signer without mutation.
+    #[arg(long)]
+    preflight: bool,
 }
 
 #[tokio::main]
@@ -68,6 +71,20 @@ async fn main() -> Result<()> {
         hosts,
         signer,
     )?);
+    if args.preflight {
+        let snapshot = control.snapshot().await?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        ensure!(
+            snapshot.promotion_readiness.eligible,
+            "promotion preflight failed: {}",
+            snapshot
+                .promotion_readiness
+                .blocker
+                .as_deref()
+                .unwrap_or("unknown readiness failure")
+        );
+        return Ok(());
+    }
     let app = dashboard::router(control, &api_token);
     let listener = tokio::net::TcpListener::bind(config.listen_address).await?;
     info!(
