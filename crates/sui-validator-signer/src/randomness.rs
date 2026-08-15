@@ -71,6 +71,7 @@ pub struct DkgCompleteResult {
 pub struct PersistedRandomnessState {
     version: u16,
     chain_id: ChainId,
+    protocol_public_key: Vec<u8>,
     sessions: BTreeMap<u64, DkgSession>,
 }
 
@@ -180,9 +181,11 @@ impl<S: RandomnessStateStore> RandomnessSessionManager<S> {
         chain_id: ChainId,
         protocol_key: AuthorityKeyPair,
     ) -> Result<Self, RandomnessError> {
+        let protocol_public_key = protocol_key.public().as_bytes().to_vec();
         let state = store.load()?.unwrap_or(PersistedRandomnessState {
             version: STATE_VERSION,
             chain_id,
+            protocol_public_key: protocol_public_key.clone(),
             sessions: BTreeMap::new(),
         });
         if state.version != STATE_VERSION {
@@ -190,6 +193,9 @@ impl<S: RandomnessStateStore> RandomnessSessionManager<S> {
         }
         if state.chain_id != chain_id {
             return Err(RandomnessError::ChainMismatch);
+        }
+        if state.protocol_public_key != protocol_public_key {
+            return Err(RandomnessError::ProtocolKeyMismatch);
         }
         Ok(Self {
             store,
@@ -486,6 +492,8 @@ pub enum RandomnessError {
     ChainMismatch,
     #[error("invalid protocol key")]
     InvalidProtocolKey,
+    #[error("randomness state belongs to another protocol key")]
+    ProtocolKeyMismatch,
     #[error("randomness session for epoch {0} is unknown")]
     UnknownEpoch(u64),
     #[error("randomness session parameters conflict for epoch {0}")]
@@ -654,6 +662,16 @@ mod tests {
             .unwrap();
         let first = manager.create_message(11).unwrap();
         drop(manager);
+
+        let (_, wrong_key) = get_authority_key_pair();
+        assert!(matches!(
+            RandomnessSessionManager::open(
+                FileRandomnessStateStore::new(&path),
+                [8; 32],
+                wrong_key,
+            ),
+            Err(RandomnessError::ProtocolKeyMismatch)
+        ));
 
         let manager =
             RandomnessSessionManager::open(FileRandomnessStateStore::new(path), [8; 32], key)

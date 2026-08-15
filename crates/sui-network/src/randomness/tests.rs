@@ -3,7 +3,7 @@
 
 use crate::{randomness::*, utils};
 use fastcrypto::{groups::bls12381, serde_helpers::ToFromByteArray};
-use fastcrypto_tbls::{mocked_dkg, nodes};
+use fastcrypto_tbls::{mocked_dkg, nodes, tbls::Share, types::ThresholdBls12381MinSig};
 use std::collections::BTreeSet;
 use sui_macros::sim_test;
 use sui_swarm_config::test_utils::CommitteeFixture;
@@ -16,6 +16,26 @@ use tracing::Instrument;
 
 type PkG = bls12381::G2Element;
 type EncG = bls12381::G2Element;
+
+#[derive(Debug)]
+struct TestExternalPartialSigner {
+    epoch: EpochId,
+    shares: Vec<Share<bls12381::Scalar>>,
+}
+
+impl RandomnessPartialSigner for TestExternalPartialSigner {
+    fn partial_sign(
+        &self,
+        epoch: EpochId,
+        round: RandomnessRound,
+    ) -> anyhow::Result<Vec<RandomnessPartialSignature>> {
+        anyhow::ensure!(epoch == self.epoch);
+        Ok(ThresholdBls12381MinSig::partial_sign_batch(
+            self.shares.iter(),
+            &round.signature_message(),
+        ))
+    }
+}
 
 #[sim_test]
 async fn test_multiple_epochs() {
@@ -60,7 +80,7 @@ async fn test_multiple_epochs() {
 
     // Test first round.
     for (authority, handle) in handles.iter() {
-        let mock_dkg_output = mocked_dkg::generate_mocked_output::<PkG, EncG>(
+        let mut mock_dkg_output = mocked_dkg::generate_mocked_output::<PkG, EncG>(
             nodes.clone(),
             committee.validity_threshold().try_into().unwrap(),
             0,
@@ -71,11 +91,16 @@ async fn test_multiple_epochs() {
                 .unwrap(),
         );
         handle.send_partial_signatures(0, RandomnessRound(0));
-        handle.update_epoch(
+        let partial_signer = Arc::new(TestExternalPartialSigner {
+            epoch: 0,
+            shares: mock_dkg_output.shares.take().unwrap(),
+        });
+        handle.update_epoch_with_signer(
             0,
             authority_info.clone(),
             mock_dkg_output,
             committee.validity_threshold().try_into().unwrap(),
+            Some(partial_signer),
             None,
         );
     }

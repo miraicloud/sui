@@ -84,11 +84,11 @@ impl BlockingValidatorSigner {
         self.commands
             .as_ref()
             .ok_or(BlockingSignerError::Standby)?
-            .blocking_send(Command::SignAuthority {
+            .try_send(Command::SignAuthority {
                 payload: payload.to_vec(),
                 response: sender,
             })
-            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+            .map_err(map_command_send_error)?;
         let bytes = receiver
             .recv()
             .map_err(|_| BlockingSignerError::WorkerStopped)??;
@@ -109,12 +109,12 @@ impl BlockingValidatorSigner {
         self.commands
             .as_ref()
             .ok_or(BlockingSignerError::Standby)?
-            .blocking_send(Command::SignConsensusBlock {
+            .try_send(Command::SignConsensusBlock {
                 operation,
                 payload,
                 response: sender,
             })
-            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+            .map_err(map_command_send_error)?;
         let bytes = receiver
             .recv()
             .map_err(|_| BlockingSignerError::WorkerStopped)??;
@@ -129,11 +129,11 @@ impl BlockingValidatorSigner {
         self.commands
             .as_ref()
             .ok_or(BlockingSignerError::Standby)?
-            .blocking_send(Command::RandomnessDkg {
+            .try_send(Command::RandomnessDkg {
                 request,
                 response: sender,
             })
-            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+            .map_err(map_command_send_error)?;
         receiver
             .recv()
             .map_err(|_| BlockingSignerError::WorkerStopped)?
@@ -148,12 +148,12 @@ impl BlockingValidatorSigner {
         self.commands
             .as_ref()
             .ok_or(BlockingSignerError::Standby)?
-            .blocking_send(Command::RandomnessPartialSign {
+            .try_send(Command::RandomnessPartialSign {
                 epoch,
                 round,
                 response: sender,
             })
-            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+            .map_err(map_command_send_error)?;
         receiver
             .recv()
             .map_err(|_| BlockingSignerError::WorkerStopped)?
@@ -197,6 +197,13 @@ enum Command {
         round: u64,
         response: std_mpsc::SyncSender<Result<Vec<u8>, BlockingSignerError>>,
     },
+}
+
+fn map_command_send_error(error: mpsc::error::TrySendError<Command>) -> BlockingSignerError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => BlockingSignerError::CommandQueueFull,
+        mpsc::error::TrySendError::Closed(_) => BlockingSignerError::WorkerStopped,
+    }
 }
 
 fn run(
@@ -343,6 +350,8 @@ pub enum BlockingSignerError {
     StartupTimeout,
     #[error("external signer worker stopped")]
     WorkerStopped,
+    #[error("external signer command queue is full")]
+    CommandQueueFull,
     #[error(transparent)]
     AuthorityPayload(#[from] AuthorityPayloadError),
     #[error("invalid consensus block signing request: {0}")]

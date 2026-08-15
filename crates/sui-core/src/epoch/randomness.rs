@@ -20,6 +20,7 @@ use rand::SeedableRng;
 use rand::rngs::{OsRng, StdRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use sui_macros::fail_point_if;
@@ -32,6 +33,10 @@ use sui_types::messages_consensus::{
     ConsensusTransaction, Round, TimestampMs, VersionedDkgConfirmation, VersionedDkgMessage,
 };
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
+use sui_validator_signer::{
+    blocking::BlockingValidatorSigner,
+    protocol::{RandomnessDkgRequest, RandomnessDkgResponse},
+};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -153,7 +158,61 @@ impl VersionedUsedProcessedMessages {
 /// Distinguishes between an active DKG participant (validator) and a read-only observer (fullnode).
 enum DkgRole {
     Party(dkg_v1::Party<PkG, EncG>),
+    Remote {
+        signer: Arc<BlockingValidatorSigner>,
+        epoch: EpochId,
+        party_id: PartyId,
+        threshold: u16,
+    },
     Observer(dkg_v1::Observer<PkG, EncG>),
+}
+
+struct RemoteRandomnessPartialSigner {
+    signer: Arc<BlockingValidatorSigner>,
+    epoch: EpochId,
+    vss_pk: fastcrypto_tbls::polynomial::Poly<PkG>,
+    expected_share_ids: Vec<fastcrypto_tbls::types::ShareIndex>,
+}
+
+impl fmt::Debug for RemoteRandomnessPartialSigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteRandomnessPartialSigner")
+            .field("epoch", &self.epoch)
+            .field("share_count", &self.expected_share_ids.len())
+            .finish()
+    }
+}
+
+impl randomness::RandomnessPartialSigner for RemoteRandomnessPartialSigner {
+    fn partial_sign(
+        &self,
+        epoch: EpochId,
+        round: RandomnessRound,
+    ) -> anyhow::Result<Vec<sui_types::crypto::RandomnessPartialSignature>> {
+        anyhow::ensure!(
+            epoch == self.epoch,
+            "external randomness signer epoch mismatch"
+        );
+        let bytes = self.signer.randomness_partial_sign(epoch, round.0)?;
+        let signatures: Vec<sui_types::crypto::RandomnessPartialSignature> =
+            bcs::from_bytes(&bytes)?;
+        anyhow::ensure!(
+            signatures
+                .iter()
+                .map(|signature| signature.index)
+                .collect::<Vec<_>>()
+                == self.expected_share_ids,
+            "external randomness signer returned unexpected share indices"
+        );
+        ThresholdBls12381MinSig::partial_verify_batch(
+            &self.vss_pk,
+            &round.signature_message(),
+            signatures.iter(),
+            &mut rand::thread_rng(),
+        )?;
+        Ok(signatures)
+    }
 }
 
 impl DkgRole {
@@ -219,8 +278,57 @@ impl DkgRole {
         }
     }
 
+    fn try_new_remote(
+        signer: Arc<BlockingValidatorSigner>,
+        epoch: EpochId,
+        nodes: nodes::Nodes<EncG>,
+        threshold: u16,
+    ) -> Option<Self> {
+        let response = signer
+            .randomness_dkg(RandomnessDkgRequest::Initialize {
+                epoch,
+                nodes: bcs::to_bytes(&nodes).ok()?,
+                threshold,
+            })
+            .map_err(|error| {
+                error!(%error, "random beacon: external signer failed to initialize DKG session")
+            })
+            .ok()?;
+        let RandomnessDkgResponse::Status(status) = response else {
+            error!("random beacon: external signer returned an unexpected DKG response");
+            return None;
+        };
+        if status.epoch != epoch || status.threshold != threshold {
+            error!(
+                "random beacon: external signer DKG status does not match requested epoch or threshold"
+            );
+            return None;
+        }
+        info!(
+            epoch,
+            party_id = status.party_id,
+            threshold,
+            shares_ready = status.shares_ready,
+            "random beacon: external signer DKG party initialized"
+        );
+        Some(Self::Remote {
+            signer,
+            epoch,
+            party_id: status.party_id,
+            threshold,
+        })
+    }
+
     fn is_party(&self) -> bool {
+        matches!(self, DkgRole::Party(_) | DkgRole::Remote { .. })
+    }
+
+    fn is_local_party(&self) -> bool {
         matches!(self, DkgRole::Party(_))
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, DkgRole::Remote { .. })
     }
 
     fn is_observer(&self) -> bool {
@@ -237,6 +345,27 @@ impl DkgRole {
                 let processed =
                     party.process_message(message.unwrap_v1(), &mut rand::thread_rng())?;
                 Ok(VersionedProcessedMessage::V1(processed))
+            }
+            DkgRole::Remote { signer, epoch, .. } => {
+                let raw_message = message.clone().unwrap_v1();
+                let response = signer
+                    .randomness_dkg(RandomnessDkgRequest::ProcessMessage {
+                        epoch: *epoch,
+                        message: bcs::to_bytes(&message)
+                            .map_err(|_| FastCryptoError::InvalidInput)?,
+                    })
+                    .map_err(|_| FastCryptoError::InvalidInput)?;
+                let RandomnessDkgResponse::MessageProcessed { sender } = response else {
+                    return Err(FastCryptoError::InvalidInput);
+                };
+                if sender != raw_message.sender {
+                    return Err(FastCryptoError::InvalidInput);
+                }
+                Ok(VersionedProcessedMessage::V1(dkg_v1::ProcessedMessage {
+                    message: raw_message,
+                    shares: vec![],
+                    complaint: None,
+                }))
             }
             DkgRole::Observer(observer) => {
                 let raw_msg = message.unwrap_v1();
@@ -271,6 +400,36 @@ impl DkgRole {
                 Ok((
                     Some(VersionedDkgConfirmation::V1(conf)),
                     VersionedUsedProcessedMessages::V1(msgs),
+                ))
+            }
+            DkgRole::Remote { signer, epoch, .. } => {
+                let response = signer
+                    .randomness_dkg(RandomnessDkgRequest::TryMerge { epoch: *epoch })
+                    .map_err(|_| FastCryptoError::InvalidInput)?;
+                let RandomnessDkgResponse::Merged {
+                    confirmation,
+                    used_messages,
+                } = response
+                else {
+                    return Err(FastCryptoError::InvalidInput);
+                };
+                let confirmation: VersionedDkgConfirmation =
+                    bcs::from_bytes(&confirmation).map_err(|_| FastCryptoError::InvalidInput)?;
+                let processed = used_messages
+                    .into_iter()
+                    .map(|bytes| {
+                        let message: VersionedDkgMessage =
+                            bcs::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
+                        Ok(dkg_v1::ProcessedMessage {
+                            message: message.unwrap_v1(),
+                            shares: vec![],
+                            complaint: None,
+                        })
+                    })
+                    .collect::<FastCryptoResult<Vec<_>>>()?;
+                Ok((
+                    Some(confirmation),
+                    VersionedUsedProcessedMessages::V1(dkg_v1::UsedProcessedMessages(processed)),
                 ))
             }
             DkgRole::Observer(observer) => {
@@ -317,6 +476,42 @@ impl DkgRole {
                         .collect::<Vec<_>>(),
                     rng,
                 )
+            }
+            DkgRole::Remote { signer, epoch, .. } => {
+                for confirmation in confirmations {
+                    let response = signer
+                        .randomness_dkg(RandomnessDkgRequest::AddConfirmation {
+                            epoch: *epoch,
+                            confirmation: bcs::to_bytes(confirmation)
+                                .map_err(|_| FastCryptoError::InvalidInput)?,
+                        })
+                        .map_err(|_| FastCryptoError::InvalidInput)?;
+                    if !matches!(
+                        response,
+                        RandomnessDkgResponse::ConfirmationProcessed { .. }
+                    ) {
+                        return Err(FastCryptoError::InvalidInput);
+                    }
+                }
+                let response = signer
+                    .randomness_dkg(RandomnessDkgRequest::TryComplete { epoch: *epoch })
+                    .map_err(|_| FastCryptoError::InvalidInput)?;
+                let RandomnessDkgResponse::Complete {
+                    public_output,
+                    threshold,
+                } = response
+                else {
+                    return Err(FastCryptoError::InvalidInput);
+                };
+                if threshold != self.threshold()? {
+                    return Err(FastCryptoError::InvalidInput);
+                }
+                let output: Output<PkG, EncG> =
+                    bcs::from_bytes(&public_output).map_err(|_| FastCryptoError::InvalidInput)?;
+                if output.shares.is_some() {
+                    return Err(FastCryptoError::InvalidInput);
+                }
+                Ok(output)
             }
             DkgRole::Observer(observer) => {
                 let raw_messages: Vec<_> = used_messages
@@ -397,6 +592,57 @@ impl DkgRole {
     fn party_id(&self) -> FastCryptoResult<PartyId> {
         match self {
             DkgRole::Party(party) => Ok(party.id),
+            DkgRole::Remote { party_id, .. } => Ok(*party_id),
+            DkgRole::Observer(_) => Err(FastCryptoError::InvalidInput),
+        }
+    }
+
+    fn threshold(&self) -> FastCryptoResult<u16> {
+        match self {
+            DkgRole::Party(party) => Ok(party.t()),
+            DkgRole::Remote { threshold, .. } => Ok(*threshold),
+            DkgRole::Observer(_) => Err(FastCryptoError::InvalidInput),
+        }
+    }
+
+    fn create_message(&self, dkg_version: u64) -> FastCryptoResult<VersionedDkgMessage> {
+        match self {
+            DkgRole::Party(party) => VersionedDkgMessage::create(dkg_version, party),
+            DkgRole::Remote { signer, epoch, .. } => {
+                let response = signer
+                    .randomness_dkg(RandomnessDkgRequest::CreateMessage { epoch: *epoch })
+                    .map_err(|_| FastCryptoError::InvalidInput)?;
+                let RandomnessDkgResponse::Message(message) = response else {
+                    return Err(FastCryptoError::InvalidInput);
+                };
+                let message: VersionedDkgMessage =
+                    bcs::from_bytes(&message).map_err(|_| FastCryptoError::InvalidInput)?;
+                if !message.is_valid_version(dkg_version) {
+                    return Err(FastCryptoError::InvalidInput);
+                }
+                Ok(message)
+            }
+            DkgRole::Observer(_) => Err(FastCryptoError::InvalidInput),
+        }
+    }
+
+    fn external_partial_signer(
+        &self,
+        output: &Output<PkG, EncG>,
+    ) -> FastCryptoResult<Option<Arc<dyn randomness::RandomnessPartialSigner>>> {
+        match self {
+            DkgRole::Remote {
+                signer,
+                epoch,
+                party_id,
+                ..
+            } => Ok(Some(Arc::new(RemoteRandomnessPartialSigner {
+                signer: signer.clone(),
+                epoch: *epoch,
+                vss_pk: output.vss_pk.clone(),
+                expected_share_ids: output.nodes.share_ids_of(*party_id)?,
+            }))),
+            DkgRole::Party(_) => Ok(None),
             DkgRole::Observer(_) => Err(FastCryptoError::InvalidInput),
         }
     }
@@ -406,6 +652,31 @@ impl DkgRole {
         output: &Output<PkG, EncG>,
         public_output: &Output<PkG, EncG>,
     ) -> FastCryptoResult<()> {
+        if let DkgRole::Remote { signer, epoch, .. } = self {
+            let response = signer
+                .randomness_dkg(RandomnessDkgRequest::TryComplete { epoch: *epoch })
+                .map_err(|_| FastCryptoError::InvalidInput)?;
+            let RandomnessDkgResponse::Complete {
+                public_output: bytes,
+                ..
+            } = response
+            else {
+                return Err(FastCryptoError::InvalidInput);
+            };
+            let signer_output: Output<PkG, EncG> =
+                bcs::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
+            if signer_output.shares.is_some()
+                || output.shares.is_some()
+                || signer_output.nodes != public_output.nodes
+                || signer_output.vss_pk != public_output.vss_pk
+                || output.nodes != public_output.nodes
+                || output.vss_pk != public_output.vss_pk
+            {
+                return Err(FastCryptoError::InvalidInput);
+            }
+            return Ok(());
+        }
+
         let party_id = self.party_id()?;
         if output.nodes != public_output.nodes || output.vss_pk != public_output.vss_pk {
             return Err(FastCryptoError::InvalidInput);
@@ -523,6 +794,43 @@ impl RandomnessManager {
         authority_key_pair: Option<&AuthorityKeyPair>,
         randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
     ) -> Option<Self> {
+        Self::try_new_internal(
+            epoch_store_weak,
+            consensus_adapter,
+            network_handle,
+            authority_key_pair,
+            None,
+            randomness_receiver_handle,
+        )
+        .await
+    }
+
+    pub async fn try_new_with_external_signer(
+        epoch_store_weak: Weak<AuthorityPerEpochStore>,
+        consensus_adapter: Box<dyn SubmitToConsensus>,
+        network_handle: randomness::Handle,
+        external_signer: Arc<BlockingValidatorSigner>,
+        randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
+    ) -> Option<Self> {
+        Self::try_new_internal(
+            epoch_store_weak,
+            consensus_adapter,
+            network_handle,
+            None,
+            Some(external_signer),
+            randomness_receiver_handle,
+        )
+        .await
+    }
+
+    async fn try_new_internal(
+        epoch_store_weak: Weak<AuthorityPerEpochStore>,
+        consensus_adapter: Box<dyn SubmitToConsensus>,
+        network_handle: randomness::Handle,
+        authority_key_pair: Option<&AuthorityKeyPair>,
+        external_signer: Option<Arc<BlockingValidatorSigner>>,
+        randomness_receiver_handle: Arc<RandomnessRoundReceiverHandle>,
+    ) -> Option<Self> {
         let epoch_store = match epoch_store_weak.upgrade() {
             Some(epoch_store) => epoch_store,
             None => {
@@ -615,12 +923,11 @@ impl RandomnessManager {
             committee.epoch()
         ));
 
-        let role = Arc::new(DkgRole::try_new(
-            authority_key_pair,
-            nodes,
-            t,
-            random_oracle,
-        )?);
+        let role = Arc::new(if let Some(signer) = external_signer {
+            DkgRole::try_new_remote(signer, committee.epoch(), nodes, t)?
+        } else {
+            DkgRole::try_new(authority_key_pair, nodes, t, random_oracle)?
+        });
         if let Ok(party_id) = role.party_id() {
             let expected_party_id: PartyId = committee
                 .authority_index(&epoch_store.name)?
@@ -669,7 +976,7 @@ impl RandomnessManager {
             .expect("typed_store should not fail");
         match dkg_output {
             Some(Some(mut dkg_output)) => {
-                if rm.role.is_party() && dkg_output.shares.is_none() {
+                if rm.role.is_local_party() && dkg_output.shares.is_none() {
                     let used_messages = tables
                         .dkg_used_messages_v2
                         .get(&SINGLETON_KEY)
@@ -737,11 +1044,16 @@ impl RandomnessManager {
                     }
                     dkg_output = recovered_output;
                     rm.local_participation = LocalRandomnessParticipation::RecoveredShares;
-                } else if rm.role.is_party() && dkg_output.shares.is_some() {
+                } else if rm.role.is_local_party() && dkg_output.shares.is_some() {
                     rm.role
                         .validate_party_output(&dkg_output, &dkg_output)
                         .ok()?;
                     rm.local_participation = LocalRandomnessParticipation::NativeShares;
+                } else if rm.role.is_remote() {
+                    rm.role
+                        .validate_party_output(&dkg_output, &dkg_output)
+                        .ok()?;
+                    rm.local_participation = LocalRandomnessParticipation::ExternalSigner;
                 } else if rm.role.is_party() {
                     rm.local_participation = LocalRandomnessParticipation::MissingShares;
                 }
@@ -761,14 +1073,15 @@ impl RandomnessManager {
                 rm.randomness_receiver_handle
                     .set_public_key(dkg_output.vss_pk.c0());
 
-                if let DkgRole::Party(party) = rm.role.as_ref()
-                    && rm.local_participation.can_sign()
-                {
-                    network_handle.update_epoch(
+                if rm.local_participation.can_sign() {
+                    let threshold = rm.role.threshold().ok()?;
+                    let partial_signer = rm.role.external_partial_signer(&dkg_output).ok()?;
+                    network_handle.update_epoch_with_signer(
                         committee.epoch(),
                         rm.authority_info.clone(),
                         dkg_output,
-                        party.t(),
+                        threshold,
+                        partial_signer,
                         highest_completed_round,
                     );
                     epoch_store.metrics.epoch_random_beacon_signer_ready.set(1);
@@ -945,13 +1258,17 @@ impl RandomnessManager {
     /// Sends the initial dkg::Message to begin the randomness DKG protocol.
     /// For observers, this is a no-op (observers don't send messages).
     pub async fn start_dkg(&mut self) -> SuiResult {
-        let party = match self.role.as_ref() {
+        match self.role.as_ref() {
             DkgRole::Observer(_) => {
                 info!("random beacon: observer started observing DKG");
                 return Ok(());
             }
-            DkgRole::Party(party) => party,
-        };
+            DkgRole::Party(_) | DkgRole::Remote { .. } => {}
+        }
+        let party_id = self
+            .role
+            .party_id()
+            .expect("active DKG role should have a party id");
 
         if let Some(confirmation) = &self.local_confirmation_to_resend {
             let epoch_store = self.epoch_store()?;
@@ -973,7 +1290,7 @@ impl RandomnessManager {
             return Ok(());
         }
 
-        if self.processed_messages.contains_key(&party.id) {
+        if self.processed_messages.contains_key(&party_id) {
             info!(
                 "random beacon: local DKG dealer message is already present in the persisted transcript"
             );
@@ -986,12 +1303,12 @@ impl RandomnessManager {
         let dkg_version = epoch_store.protocol_config().dkg_version();
         info!("random beacon: starting DKG, version {dkg_version}");
 
-        let msg = match VersionedDkgMessage::create(dkg_version, party) {
+        let msg = match self.role.create_message(dkg_version) {
             Ok(msg) => msg,
             Err(FastCryptoError::IgnoredMessage) => {
                 info!(
                     "random beacon: no DKG Message for party id={} (zero weight)",
-                    party.id
+                    party_id
                 );
                 return Ok(());
             }
@@ -1228,6 +1545,49 @@ impl RandomnessManager {
                                 );
                                 epoch_store.metrics.epoch_random_beacon_signer_ready.set(1);
                             }
+                        }
+                        DkgRole::Remote {
+                            party_id,
+                            threshold,
+                            ..
+                        } => {
+                            let num_shares = output
+                                .nodes
+                                .share_ids_of(*party_id)
+                                .expect("remote DKG party id should be valid")
+                                .len();
+                            self.local_participation = LocalRandomnessParticipation::ExternalSigner;
+                            info!(
+                                "random beacon: DKG complete with external signer epoch={epoch} \
+                                 commit_round={round} num_messages={num_messages} \
+                                 num_confirmations={num_confirmations} num_shares={num_shares} \
+                                 epoch_elapsed_ms={epoch_elapsed}"
+                            );
+                            epoch_store
+                                .metrics
+                                .epoch_random_beacon_dkg_num_shares
+                                .set(num_shares as i64);
+                            epoch_store
+                                .metrics
+                                .epoch_random_beacon_local_shares_ready
+                                .set(1);
+                            epoch_store
+                                .metrics
+                                .epoch_random_beacon_recovered_shares
+                                .set(0);
+                            let partial_signer = self
+                                .role
+                                .external_partial_signer(&output)
+                                .expect("remote DKG output should construct a partial signer");
+                            self.network_handle.update_epoch_with_signer(
+                                epoch_store.committee().epoch(),
+                                self.authority_info.clone(),
+                                output,
+                                *threshold,
+                                partial_signer,
+                                None,
+                            );
+                            epoch_store.metrics.epoch_random_beacon_signer_ready.set(1);
                         }
                         DkgRole::Observer(_) => {
                             info!(
@@ -1499,12 +1859,16 @@ pub enum LocalRandomnessParticipation {
     Pending,
     NativeShares,
     RecoveredShares,
+    ExternalSigner,
     MissingShares,
 }
 
 impl LocalRandomnessParticipation {
     pub fn can_sign(self) -> bool {
-        matches!(self, Self::NativeShares | Self::RecoveredShares)
+        matches!(
+            self,
+            Self::NativeShares | Self::RecoveredShares | Self::ExternalSigner
+        )
     }
 }
 

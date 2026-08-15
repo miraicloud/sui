@@ -133,6 +133,7 @@ impl UnstartedRandomness {
                 peer_share_ids: None,
                 blocked_share_id_count: 0,
                 dkg_output: None,
+                partial_signer: None,
                 aggregation_threshold: 0,
                 highest_requested_round: BTreeMap::new(),
                 send_tasks: BTreeMap::new(),

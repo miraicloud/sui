@@ -1531,7 +1531,9 @@ impl SuiNode {
             registry_service,
             client,
             node_role,
-            external_validator_signer.map(|signer| BlockSigner::new(signer)),
+            external_validator_signer
+                .clone()
+                .map(|signer| BlockSigner::new(signer)),
         ));
 
         // This only gets started up once, not on every epoch. (Make call to remove every epoch.)
@@ -1581,6 +1583,7 @@ impl SuiNode {
 
         Self::start_epoch_specific_validator_components(
             &config,
+            external_validator_signer,
             state.clone(),
             consensus_adapter,
             checkpoint_store,
@@ -1636,6 +1639,7 @@ impl SuiNode {
 
     async fn start_epoch_specific_validator_components(
         config: &NodeConfig,
+        external_validator_signer: Option<Arc<BlockingValidatorSigner>>,
         state: Arc<AuthorityState>,
         consensus_adapter: Arc<ConsensusAdapter>,
         checkpoint_store: Arc<CheckpointStore>,
@@ -1672,27 +1676,29 @@ impl SuiNode {
         randomness_receiver_handle.clear_public_key();
 
         if node_role.runs_consensus() && epoch_store.randomness_state_enabled() {
-            let authority_key_pair = if node_role.is_validator() {
-                if config.external_validator_signer.is_some() {
-                    warn!(
-                        "external signer mode is observing randomness DKG without local shares; \
-                         this validator will not contribute randomness partial signatures"
-                    );
-                    None
-                } else {
-                    Some(config.protocol_key_pair())
-                }
+            let randomness_manager = if node_role.is_validator()
+                && let Some(external_signer) = external_validator_signer
+            {
+                RandomnessManager::try_new_with_external_signer(
+                    Arc::downgrade(&epoch_store),
+                    Box::new(consensus_adapter.clone()),
+                    randomness_handle,
+                    external_signer,
+                    randomness_receiver_handle.clone(),
+                )
+                .await
             } else {
-                None
+                let authority_key_pair =
+                    node_role.is_validator().then(|| config.protocol_key_pair());
+                RandomnessManager::try_new(
+                    Arc::downgrade(&epoch_store),
+                    Box::new(consensus_adapter.clone()),
+                    randomness_handle,
+                    authority_key_pair,
+                    randomness_receiver_handle.clone(),
+                )
+                .await
             };
-            let randomness_manager = RandomnessManager::try_new(
-                Arc::downgrade(&epoch_store),
-                Box::new(consensus_adapter.clone()),
-                randomness_handle,
-                authority_key_pair,
-                randomness_receiver_handle.clone(),
-            )
-            .await;
             if let Some(randomness_manager) = randomness_manager {
                 epoch_store
                     .set_randomness_manager(randomness_manager)
@@ -2340,6 +2346,7 @@ impl SuiNode {
                     info!("Restarting consensus as {new_role}");
                     let components = Self::start_epoch_specific_validator_components(
                         &self.config,
+                        self.external_validator_signer.clone(),
                         self.state.clone(),
                         consensus_adapter,
                         self.checkpoint_store.clone(),

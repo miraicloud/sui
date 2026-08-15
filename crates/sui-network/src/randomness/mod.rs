@@ -17,6 +17,7 @@ use mysten_network::anemo_ext::NetworkExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, btree_map::BTreeMap},
+    fmt,
     ops::Bound,
     sync::Arc,
     time::{self, Duration},
@@ -48,6 +49,45 @@ pub use generated::{
     randomness_client::RandomnessClient,
     randomness_server::{Randomness, RandomnessServer},
 };
+
+/// Supplies this validator's threshold signatures without requiring DKG shares in the network
+/// process. Implementations must bind the request to the exact epoch and randomness round.
+pub trait RandomnessPartialSigner: Send + Sync + fmt::Debug {
+    fn partial_sign(
+        &self,
+        epoch: EpochId,
+        round: RandomnessRound,
+    ) -> Result<Vec<RandomnessPartialSignature>>;
+}
+
+struct LocalRandomnessPartialSigner {
+    epoch: EpochId,
+    shares: Vec<fastcrypto_tbls::tbls::Share<bls12381::Scalar>>,
+}
+
+impl fmt::Debug for LocalRandomnessPartialSigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalRandomnessPartialSigner")
+            .field("epoch", &self.epoch)
+            .field("share_count", &self.shares.len())
+            .finish()
+    }
+}
+
+impl RandomnessPartialSigner for LocalRandomnessPartialSigner {
+    fn partial_sign(
+        &self,
+        epoch: EpochId,
+        round: RandomnessRound,
+    ) -> Result<Vec<RandomnessPartialSignature>> {
+        anyhow::ensure!(epoch == self.epoch, "randomness signer epoch mismatch");
+        Ok(ThresholdBls12381MinSig::partial_sign_batch(
+            self.shares.iter(),
+            &round.signature_message(),
+        ))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendSignaturesRequest {
@@ -82,12 +122,32 @@ impl Handle {
         aggregation_threshold: u16,
         recovered_last_completed_round: Option<RandomnessRound>, // set to None if not starting up mid-epoch
     ) {
+        self.update_epoch_with_signer(
+            new_epoch,
+            authority_info,
+            dkg_output,
+            aggregation_threshold,
+            None,
+            recovered_last_completed_round,
+        );
+    }
+
+    pub fn update_epoch_with_signer(
+        &self,
+        new_epoch: EpochId,
+        authority_info: HashMap<AuthorityName, (PeerId, PartyId)>,
+        dkg_output: dkg_v1::Output<bls12381::G2Element, bls12381::G2Element>,
+        aggregation_threshold: u16,
+        partial_signer: Option<Arc<dyn RandomnessPartialSigner>>,
+        recovered_last_completed_round: Option<RandomnessRound>,
+    ) {
         self.sender
             .try_send(RandomnessMessage::UpdateEpoch(
                 new_epoch,
                 authority_info,
                 dkg_output,
                 aggregation_threshold,
+                partial_signer,
                 recovered_last_completed_round,
             ))
             .expect("RandomnessEventLoop mailbox should not overflow or be closed")
@@ -180,7 +240,8 @@ enum RandomnessMessage {
         EpochId,
         HashMap<AuthorityName, (PeerId, PartyId)>,
         dkg_v1::Output<bls12381::G2Element, bls12381::G2Element>,
-        u16,                     // aggregation_threshold
+        u16, // aggregation_threshold
+        Option<Arc<dyn RandomnessPartialSigner>>,
         Option<RandomnessRound>, // recovered_highest_completed_round
     ),
     SendPartialSignatures(EpochId, RandomnessRound),
@@ -223,6 +284,7 @@ struct RandomnessEventLoop {
     peer_share_ids: Option<HashMap<PeerId, Vec<ShareIndex>>>,
     blocked_share_id_count: usize,
     dkg_output: Option<dkg_v1::Output<bls12381::G2Element, bls12381::G2Element>>,
+    partial_signer: Option<Arc<dyn RandomnessPartialSigner>>,
     aggregation_threshold: u16,
     highest_requested_round: BTreeMap<EpochId, RandomnessRound>,
     send_tasks: BTreeMap<
@@ -267,6 +329,7 @@ impl RandomnessEventLoop {
                 authority_info,
                 dkg_output,
                 aggregation_threshold,
+                partial_signer,
                 recovered_highest_completed_round,
             ) => {
                 if let Err(e) = self.update_epoch(
@@ -274,6 +337,7 @@ impl RandomnessEventLoop {
                     authority_info,
                     dkg_output,
                     aggregation_threshold,
+                    partial_signer,
                     recovered_highest_completed_round,
                 ) {
                     error!("BUG: failed to update epoch in RandomnessEventLoop: {e:?}");
@@ -321,6 +385,7 @@ impl RandomnessEventLoop {
         authority_info: HashMap<AuthorityName, (PeerId, PartyId)>,
         dkg_output: dkg_v1::Output<bls12381::G2Element, bls12381::G2Element>,
         aggregation_threshold: u16,
+        partial_signer: Option<Arc<dyn RandomnessPartialSigner>>,
         recovered_highest_completed_round: Option<RandomnessRound>,
     ) -> Result<()> {
         assert!(self.dkg_output.is_none() || new_epoch > self.epoch);
@@ -346,6 +411,17 @@ impl RandomnessEventLoop {
             .update(Arc::new(self.allowed_peers_set.clone()));
         self.epoch = new_epoch;
         self.authority_info = Arc::new(authority_info);
+        self.partial_signer = partial_signer.or_else(|| {
+            dkg_output
+                .shares
+                .as_ref()
+                .map(|shares| -> Arc<dyn RandomnessPartialSigner> {
+                    Arc::new(LocalRandomnessPartialSigner {
+                        epoch: new_epoch,
+                        shares: shares.clone(),
+                    })
+                })
+        });
         self.dkg_output = Some(dkg_output);
         self.aggregation_threshold = aggregation_threshold;
         if let Some(round) = recovered_highest_completed_round {
@@ -831,13 +907,11 @@ impl RandomnessEventLoop {
     }
 
     fn maybe_start_pending_tasks(&mut self) {
-        let dkg_output = if let Some(dkg_output) = &self.dkg_output {
-            dkg_output
-        } else {
+        if self.dkg_output.is_none() {
             return; // wait for DKG
-        };
-        let shares = if let Some(shares) = &dkg_output.shares {
-            shares
+        }
+        let partial_signer = if let Some(partial_signer) = &self.partial_signer {
+            partial_signer.clone()
         } else {
             return; // can't participate in randomness generation without shares
         };
@@ -869,6 +943,13 @@ impl RandomnessEventLoop {
                 break; // limit concurrent tasks
             }
 
+            let partial_sigs = match partial_signer.partial_sign(self.epoch, round) {
+                Ok(partial_sigs) => partial_sigs,
+                Err(error) => {
+                    error!(%error, "failed to generate local randomness partial signatures");
+                    break;
+                }
+            };
             let full_sig_cell = Arc::new(OnceCell::new());
             self.send_tasks.entry(round).or_insert_with(|| {
                 let name = self.name;
@@ -877,10 +958,6 @@ impl RandomnessEventLoop {
                 let metrics = self.metrics.clone();
                 let authority_info = self.authority_info.clone();
                 let epoch = self.epoch;
-                let partial_sigs = ThresholdBls12381MinSig::partial_sign_batch(
-                    shares.iter(),
-                    &round.signature_message(),
-                );
                 metrics.record_partial_signatures(round);
                 let full_sig_cell_clone = full_sig_cell.clone();
 
@@ -1035,16 +1112,17 @@ impl RandomnessEventLoop {
     }
 
     fn admin_get_partial_signatures(&self, round: RandomnessRound, tx: oneshot::Sender<Vec<u8>>) {
-        let shares = if let Some(shares) = self.dkg_output.as_ref().and_then(|d| d.shares.as_ref())
-        {
-            shares
+        let partial_signer = if let Some(partial_signer) = &self.partial_signer {
+            partial_signer
         } else {
             let _ = tx.send(Vec::new()); // no error handling needed if receiver is already dropped
             return;
         };
 
-        let partial_sigs =
-            ThresholdBls12381MinSig::partial_sign_batch(shares.iter(), &round.signature_message());
+        let Ok(partial_sigs) = partial_signer.partial_sign(self.epoch, round) else {
+            let _ = tx.send(Vec::new());
+            return;
+        };
         // no error handling needed if receiver is already dropped
         let _ = tx.send(bcs::to_bytes(&partial_sigs).expect("serialization should not fail"));
     }

@@ -398,6 +398,7 @@ impl From<ServiceError> for Status {
             | ServiceError::Randomness(
                 RandomnessError::ChainMismatch
                 | RandomnessError::InvalidProtocolKey
+                | RandomnessError::ProtocolKeyMismatch
                 | RandomnessError::UnsupportedStateVersion(_)
                 | RandomnessError::LockPoisoned
                 | RandomnessError::InvalidStatePath(_)
