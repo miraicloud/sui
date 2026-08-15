@@ -160,12 +160,22 @@ pub struct ControlSnapshot {
     pub signer_public_keys: SignerPublicKeys,
     pub signer: SignerStatus,
     pub active_operation: Option<PromotionRecord>,
+    pub promotion_readiness: PromotionReadiness,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SignerPublicKeys {
     pub protocol_public_key: String,
     pub worker_public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PromotionReadiness {
+    pub eligible: bool,
+    pub source_host: Option<String>,
+    pub target_host: Option<String>,
+    pub expected_source_generation: Option<u64>,
+    pub blocker: Option<String>,
 }
 
 impl From<PublicKeys> for SignerPublicKeys {
@@ -313,11 +323,20 @@ impl ControlPlane {
             .as_ref()
             .and_then(|operation_id| state.operations.get(operation_id))
             .cloned();
+        let promotion_readiness = promotion_readiness(
+            &hosts,
+            &signer_public_keys,
+            &signer,
+            active_operation.as_ref(),
+            self.config.max_checkpoint_lag,
+            self.config.max_commit_lag,
+        );
         Ok(ControlSnapshot {
             hosts,
             signer_public_keys,
             signer,
             active_operation,
+            promotion_readiness,
         })
     }
 
@@ -379,9 +398,29 @@ impl ControlPlane {
         }
 
         if record.phase == PromotionPhase::Prepared {
-            let baseline = self
+            let baseline = match self
                 .preflight(source, target, expected_source_generation)
-                .await?;
+                .await
+            {
+                Ok(baseline) => baseline,
+                Err(error) => {
+                    // No host or signer mutation has happened in Prepared. A
+                    // failed readiness check must not strand the controller
+                    // behind an operation created from a stale browser view.
+                    let mut state = self.state.lock().await;
+                    if state.active_operation.as_deref() == Some(&operation_id)
+                        && state
+                            .operations
+                            .get(&operation_id)
+                            .is_some_and(|operation| operation.phase == PromotionPhase::Prepared)
+                    {
+                        state.operations.remove(&operation_id);
+                        state.active_operation = None;
+                        save_state(&self.config.state_path, &state)?;
+                    }
+                    return Err(error);
+                }
+            };
             record.target_baseline = Some(baseline);
             self.advance(&mut record, PromotionPhase::PreflightPassed)
                 .await?;
@@ -520,58 +559,25 @@ impl ControlPlane {
             },
         )?;
 
-        require_service(&source_status, NodeProfile::Validator, ServiceState::Active)?;
-        require_service(&target_status, NodeProfile::Observer, ServiceState::Active)?;
-        if source_status.protocol_public_key != target_status.protocol_public_key
-            || source_status.worker_public_key != target_status.worker_public_key
-            || source_status.network_public_key != target_status.network_public_key
-        {
-            return Err(ControlError::IdentityMismatch);
-        }
-        if source_status.protocol_public_key != hex::encode(signer_public_keys.protocol_bls12381)
-            || source_status.worker_public_key != hex::encode(signer_public_keys.worker_ed25519)
-        {
-            return Err(ControlError::SignerIdentityMismatch);
-        }
-        if source_metrics.epoch != target_metrics.epoch {
-            return Err(ControlError::EpochMismatch {
-                source_epoch: source_metrics.epoch,
-                target_epoch: target_metrics.epoch,
-            });
-        }
-        if source_metrics.voting_right == 0 || target_metrics.voting_right != 0 {
-            return Err(ControlError::VotingRoleMismatch);
-        }
-        if source_metrics.dkg_failed || target_metrics.dkg_failed {
-            return Err(ControlError::DkgFailed);
-        }
-        if target_metrics.last_commit_index == 0
-            || target_metrics.last_executed_checkpoint == 0
-            || target_metrics.observer_subscribed_batches == 0
-        {
-            return Err(ControlError::ObserverNotWarm);
-        }
-        let checkpoint_lag = source_metrics
-            .last_executed_checkpoint
-            .saturating_sub(target_metrics.last_executed_checkpoint);
-        if checkpoint_lag > self.config.max_checkpoint_lag {
-            return Err(ControlError::CheckpointLag(checkpoint_lag));
-        }
-        let commit_lag = source_metrics
-            .last_commit_index
-            .saturating_sub(target_metrics.last_commit_index);
-        if commit_lag > self.config.max_commit_lag {
-            return Err(ControlError::CommitLag(commit_lag));
-        }
-        let lease = signer_status
-            .current_lease
-            .as_ref()
-            .ok_or(ControlError::NoSourceLease)?;
-        if lease.holder_id != source.expected_holder_id || lease.generation != expected_generation {
-            return Err(ControlError::SourceLeaseMismatch);
-        }
-        require_randomness_ready(&signer_status, source_metrics.epoch)?;
-        Ok(target_metrics)
+        validate_preflight(
+            &HostSnapshot {
+                host_id: source.host_id.clone(),
+                expected_holder_id: hex::encode(source.expected_holder_id),
+                status: source_status,
+                metrics: source_metrics,
+            },
+            &HostSnapshot {
+                host_id: target.host_id.clone(),
+                expected_holder_id: hex::encode(target.expected_holder_id),
+                status: target_status,
+                metrics: target_metrics,
+            },
+            &signer_status,
+            &SignerPublicKeys::from(signer_public_keys),
+            expected_generation,
+            self.config.max_checkpoint_lag,
+            self.config.max_commit_lag,
+        )
     }
 
     async fn wait_for_lease_fence(
@@ -643,6 +649,153 @@ impl ControlPlane {
         }
         save_state(&self.config.state_path, &state)
     }
+}
+
+fn promotion_readiness(
+    hosts: &[HostSnapshot],
+    signer_public_keys: &SignerPublicKeys,
+    signer: &SignerStatus,
+    active_operation: Option<&PromotionRecord>,
+    max_checkpoint_lag: u64,
+    max_commit_lag: u64,
+) -> PromotionReadiness {
+    if let Some(operation) = active_operation {
+        return PromotionReadiness {
+            eligible: false,
+            source_host: Some(operation.source_host.clone()),
+            target_host: Some(operation.target_host.clone()),
+            expected_source_generation: Some(operation.expected_source_generation),
+            blocker: Some(format!(
+                "promotion {} is already in progress",
+                operation.operation_id
+            )),
+        };
+    }
+    let Some(lease) = signer.current_lease.as_ref() else {
+        return blocked_readiness(None, None, None, ControlError::NoSourceLease);
+    };
+    let holder = hex::encode(lease.holder_id);
+    let Some(source) = hosts.iter().find(|host| host.expected_holder_id == holder) else {
+        return blocked_readiness(
+            None,
+            None,
+            Some(lease.generation),
+            ControlError::SourceLeaseMismatch,
+        );
+    };
+    let Some(target) = hosts.iter().find(|host| host.host_id != source.host_id) else {
+        return blocked_readiness(
+            Some(source.host_id.clone()),
+            None,
+            Some(lease.generation),
+            ControlError::InsufficientHosts,
+        );
+    };
+    match validate_preflight(
+        source,
+        target,
+        signer,
+        signer_public_keys,
+        lease.generation,
+        max_checkpoint_lag,
+        max_commit_lag,
+    ) {
+        Ok(_) => PromotionReadiness {
+            eligible: true,
+            source_host: Some(source.host_id.clone()),
+            target_host: Some(target.host_id.clone()),
+            expected_source_generation: Some(lease.generation),
+            blocker: None,
+        },
+        Err(error) => blocked_readiness(
+            Some(source.host_id.clone()),
+            Some(target.host_id.clone()),
+            Some(lease.generation),
+            error,
+        ),
+    }
+}
+
+fn blocked_readiness(
+    source_host: Option<String>,
+    target_host: Option<String>,
+    expected_source_generation: Option<u64>,
+    error: ControlError,
+) -> PromotionReadiness {
+    PromotionReadiness {
+        eligible: false,
+        source_host,
+        target_host,
+        expected_source_generation,
+        blocker: Some(error.to_string()),
+    }
+}
+
+fn validate_preflight(
+    source: &HostSnapshot,
+    target: &HostSnapshot,
+    signer_status: &SignerStatus,
+    signer_public_keys: &SignerPublicKeys,
+    expected_generation: u64,
+    max_checkpoint_lag: u64,
+    max_commit_lag: u64,
+) -> Result<ValidatorMetrics, ControlError> {
+    require_service(&source.status, NodeProfile::Validator, ServiceState::Active)?;
+    require_service(&target.status, NodeProfile::Observer, ServiceState::Active)?;
+    if source.status.protocol_public_key != target.status.protocol_public_key
+        || source.status.worker_public_key != target.status.worker_public_key
+        || source.status.network_public_key != target.status.network_public_key
+    {
+        return Err(ControlError::IdentityMismatch);
+    }
+    if source.status.protocol_public_key != signer_public_keys.protocol_public_key
+        || source.status.worker_public_key != signer_public_keys.worker_public_key
+    {
+        return Err(ControlError::SignerIdentityMismatch);
+    }
+    if source.metrics.epoch != target.metrics.epoch {
+        return Err(ControlError::EpochMismatch {
+            source_epoch: source.metrics.epoch,
+            target_epoch: target.metrics.epoch,
+        });
+    }
+    if source.metrics.voting_right == 0 || target.metrics.voting_right != 0 {
+        return Err(ControlError::VotingRoleMismatch);
+    }
+    if source.metrics.dkg_failed || target.metrics.dkg_failed {
+        return Err(ControlError::DkgFailed);
+    }
+    if target.metrics.last_commit_index == 0
+        || target.metrics.last_executed_checkpoint == 0
+        || target.metrics.observer_subscribed_batches == 0
+    {
+        return Err(ControlError::ObserverNotWarm);
+    }
+    let checkpoint_lag = source
+        .metrics
+        .last_executed_checkpoint
+        .saturating_sub(target.metrics.last_executed_checkpoint);
+    if checkpoint_lag > max_checkpoint_lag {
+        return Err(ControlError::CheckpointLag(checkpoint_lag));
+    }
+    let commit_lag = source
+        .metrics
+        .last_commit_index
+        .saturating_sub(target.metrics.last_commit_index);
+    if commit_lag > max_commit_lag {
+        return Err(ControlError::CommitLag(commit_lag));
+    }
+    let lease = signer_status
+        .current_lease
+        .as_ref()
+        .ok_or(ControlError::NoSourceLease)?;
+    if hex::encode(lease.holder_id) != source.expected_holder_id
+        || lease.generation != expected_generation
+    {
+        return Err(ControlError::SourceLeaseMismatch);
+    }
+    require_randomness_ready(signer_status, source.metrics.epoch)?;
+    Ok(target.metrics.clone())
 }
 
 fn require_service(
@@ -1053,6 +1206,11 @@ mod tests {
             snapshot.signer_public_keys.protocol_public_key,
             hex::encode([1; 96])
         );
+        assert!(snapshot.promotion_readiness.eligible);
+        assert_eq!(
+            snapshot.promotion_readiness.target_host.as_deref(),
+            Some("target")
+        );
         assert!(snapshot.active_operation.is_none());
         assert!(shared.events.lock().unwrap().is_empty());
     }
@@ -1122,6 +1280,24 @@ mod tests {
             Err(ControlError::IdentityMismatch)
         ));
         assert!(shared.events.lock().unwrap().is_empty());
+        assert!(control.snapshot().await.unwrap().active_operation.is_none());
+        shared
+            .hosts
+            .lock()
+            .unwrap()
+            .get_mut("target")
+            .unwrap()
+            .network_public_key = hex::encode([3; 32]);
+        let retry = control
+            .promote(
+                "drill-002-retry".to_owned(),
+                "source".to_owned(),
+                "target".to_owned(),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.phase, PromotionPhase::Complete);
     }
 
     #[tokio::test]

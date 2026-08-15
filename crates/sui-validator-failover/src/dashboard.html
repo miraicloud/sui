@@ -328,6 +328,7 @@
         const role = status.profile || "stopped";
         const service = typeof status.service_state === "string" ? status.service_state : "unknown";
         const isLeaseOwner = leaseOwner?.host_id === host.host_id;
+        const promotable = snapshot.promotion_readiness?.eligible && snapshot.promotion_readiness.target_host === host.host_id;
         return `<article class="host">
           <div class="host-head">
             <div><div class="eyebrow">${isLeaseOwner ? "Signer lease holder" : "Standby candidate"}</div><h3 class="host-name">${escapeHtml(host.host_id)}</h3></div>
@@ -345,14 +346,16 @@
             HOLDER CERTIFICATE DIGEST<code title="${escapeHtml(host.expected_holder_id)}">${escapeHtml(compact(host.expected_holder_id, 12))}</code>
             VALIDATOR NETWORK KEY<code title="${escapeHtml(status.network_public_key)}">${escapeHtml(compact(status.network_public_key, 12))}</code>
           </div>
-          <div class="host-actions"><button class="btn btn-primary promote" data-target="${escapeHtml(host.host_id)}" ${role === "observer" && !snapshot.active_operation ? "" : "disabled"}>Promote this host</button></div>
+          <div class="host-actions"><button class="btn btn-primary promote" data-target="${escapeHtml(host.host_id)}" ${promotable ? "" : "disabled"}>Promote this host</button></div>
         </article>`;
       };
       const renderChecks = (data) => {
         const [first, second] = data.hosts;
         const source = leaseHost(data);
         const target = data.hosts.find((host) => host.host_id !== source?.host_id);
+        const readiness = data.promotion_readiness;
         const checks = [
+          [readiness?.eligible ? "Server preflight accepted" : `Server preflight: ${readiness?.blocker || "unavailable"}`, Boolean(readiness?.eligible)],
           ["Signer lease mapped", Boolean(source)],
           ["Distinct holder certificates", first?.expected_holder_id !== second?.expected_holder_id],
           ["Candidate identities agree", first?.status.protocol_public_key === second?.status.protocol_public_key && first?.status.worker_public_key === second?.status.worker_public_key && first?.status.network_public_key === second?.status.network_public_key],
@@ -402,11 +405,12 @@
         }
       };
       const openConfirmation = (targetId) => {
-        const source = leaseHost(snapshot);
-        const target = snapshot.hosts.find((host) => host.host_id === targetId);
-        const generation = snapshot.signer.current_lease?.generation;
-        if (!source || !target || generation == null) { showError("Cannot resolve the active signer lease to a source host."); return; }
-        prepareConfirmation(source.host_id, target.host_id, generation, null);
+        const readiness = snapshot?.promotion_readiness;
+        if (!readiness?.eligible || readiness.target_host !== targetId || readiness.expected_source_generation == null) {
+          showError(`Promotion is locked: ${readiness?.blocker || "server preflight has not accepted this target"}`);
+          return;
+        }
+        prepareConfirmation(readiness.source_host, readiness.target_host, readiness.expected_source_generation, null);
       };
       const openRecordConfirmation = (record) => {
         prepareConfirmation(record.source_host, record.target_host, record.expected_source_generation, record.operation_id);

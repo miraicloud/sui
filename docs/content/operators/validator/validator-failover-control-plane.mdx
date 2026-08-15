@@ -70,6 +70,10 @@ Promotion is disabled when identity fingerprints differ, the backup is outside
 configured lag bounds, its database is unhealthy, the signer is unavailable,
 or a different promotion operation is already in progress. A missing or
 incomplete signer-owned DKG session is a hard readiness failure, not a warning.
+The readiness result in each dashboard snapshot is computed by the controller,
+including the exact source, target, and source lease generation. Browser code
+does not decide whether a target is eligible, and the controller evaluates the
+same policy again immediately before the first mutating step.
 
 ## Fenced promotion
 
