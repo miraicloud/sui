@@ -6,15 +6,35 @@ license = "Apache-2.0"
 publish = false
 edition = "2024"
 
+[[bin]]
+name = "sui-validator-signer"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 bcs.workspace = true
+clap.workspace = true
+consensus-config.workspace = true
+fastcrypto.workspace = true
+hex.workspace = true
+prost.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_yaml.workspace = true
+sui-keys.workspace = true
+sui-types.workspace = true
+telemetry-subscribers.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tonic.workspace = true
+tonic-prost.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tempfile = "3.3.0"
-

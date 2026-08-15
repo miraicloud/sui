@@ -50,15 +50,33 @@ impl FileStateStore {
     }
 
     fn temp_path(&self) -> PathBuf {
-        self.path.with_extension("new")
+        let mut suffix = [0; 8];
+        OsRng.fill_bytes(&mut suffix);
+        self.path
+            .with_extension(format!("new.{}", hex::encode(suffix)))
     }
 }
 
 impl StateStore for FileStateStore {
     fn load(&self) -> Result<Option<PersistedState>, PolicyError> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(PolicyError::Io(error)),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(PolicyError::InvalidStateFile(self.path.clone()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(PolicyError::InsecureStatePermissions(self.path.clone()));
+            }
+        }
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(PolicyError::Io(error)),
         };
         let state = bcs::from_bytes(&bytes).map_err(PolicyError::Deserialize)?;
@@ -77,7 +95,7 @@ impl StateStore for FileStateStore {
         let temp_path = self.temp_path();
         let bytes = bcs::to_bytes(state).map_err(PolicyError::Serialize)?;
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -350,6 +368,10 @@ pub enum PolicyError {
     LockPoisoned,
     #[error("unsupported signer state version {0}")]
     UnsupportedStateVersion(u16),
+    #[error("signer state path is not a regular file: {0}")]
+    InvalidStateFile(PathBuf),
+    #[error("signer state file is accessible by group or other users: {0}")]
+    InsecureStatePermissions(PathBuf),
     #[error("failed to serialize signer state: {0}")]
     Serialize(bcs::Error),
     #[error("failed to deserialize signer state: {0}")]
@@ -622,6 +644,36 @@ mod tests {
                 MAX_TTL_MS
             ),
             Err(PolicyError::ClockMovedBackwards)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_insecure_or_non_regular_state_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TempDir::new().unwrap();
+        let clock = TestClock::default();
+        clock.set(100);
+        let state_path = directory.path().join("state.bcs");
+        {
+            let policy =
+                SignerPolicy::open(FileStateStore::new(&state_path), clock.clone(), MAX_TTL_MS)
+                    .unwrap();
+            policy.acquire(holder(1), 100).unwrap();
+        }
+
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            SignerPolicy::open(FileStateStore::new(&state_path), clock.clone(), MAX_TTL_MS),
+            Err(PolicyError::InsecureStatePermissions(_))
+        ));
+
+        let symlink_path = directory.path().join("state-link.bcs");
+        symlink(&state_path, &symlink_path).unwrap();
+        assert!(matches!(
+            SignerPolicy::open(FileStateStore::new(&symlink_path), clock, MAX_TTL_MS),
+            Err(PolicyError::InvalidStateFile(_))
         ));
     }
 }

@@ -17620,11 +17620,26 @@ dependencies = [
 name = "sui-validator-signer"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "bcs",
+ "clap",
+ "consensus-config",
+ "fastcrypto",
+ "hex",
+ "prost 0.14.1",
  "rand 0.8.5",
  "serde",
+ "serde_yaml 0.8.26",
+ "sui-keys",
+ "sui-types",
+ "telemetry-subscribers",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.14.6",
+ "tonic-build",
+ "tonic-prost",
+ "tracing",
 ]
 
 [[package]]

@@ -53,6 +53,18 @@ pub enum OperationKey {
     },
 }
 
+impl OperationKey {
+    pub fn chain_id(&self) -> &ChainId {
+        match self {
+            Self::ConsensusBlock { chain_id, .. }
+            | Self::TransactionEffects { chain_id, .. }
+            | Self::CheckpointSummary { chain_id, .. }
+            | Self::DkgContribution { chain_id, .. }
+            | Self::RandomnessPartialSignature { chain_id, .. } => chain_id,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum DkgStage {
     Message,
