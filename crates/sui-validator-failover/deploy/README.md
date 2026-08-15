@@ -3,20 +3,16 @@
 These files are templates for the two-node Testnet fire drill. They contain no
 private keys, certificates, tokens, hostnames, or validator identity material.
 
-Build all four pinned binaries from one revision and record their hashes:
+Build all four pinned binaries from one revision on an x86_64 Linux builder and
+record their hashes. The build script refuses a dirty tree or a non-Linux,
+non-x86_64 host, uses `Cargo.lock`, embeds the full source revision in every
+binary, and emits a reproducible archive with an internal checksum manifest:
 
 ```sh
-GIT_REVISION="$(git rev-parse HEAD)" cargo build --release \
-  --bin sui-node \
-  --bin sui-validator-signer \
-  --bin sui-validator-agent \
-  --bin sui-validator-control
-
-sha256sum \
-  target/release/sui-node \
-  target/release/sui-validator-signer \
-  target/release/sui-validator-agent \
-  target/release/sui-validator-control
+crates/sui-validator-failover/deploy/build-release-bundle.sh \
+  /tmp/tomodachi-sui-failover.tar.gz
+crates/sui-validator-failover/deploy/verify-release-bundle.sh \
+  /tmp/tomodachi-sui-failover.tar.gz
 ```
 
 Every binary supports `--version` and must report the same Sui version and Git
@@ -26,11 +22,21 @@ container update during a fire drill.
 
 Generate a dedicated CA or intermediate for this deployment and separate
 client certificates for validator A, validator B, the signer status reader, and
-the controller. Compute allowlist IDs from certificate DER bytes:
+the controller. The bootstrap script creates only transport credentials; it
+does not read, create, copy, or migrate Sui validator signing keys:
 
 ```sh
-openssl x509 -in client.crt -outform DER | b2sum -l 256
+crates/sui-validator-failover/deploy/bootstrap-pki.sh \
+  /secure/failover-pki \
+  validator-signer.internal \
+  validator-a.internal \
+  validator-b.internal
 ```
+
+The generated `certificate-digests.yaml` contains the exact BLAKE2b-256 DER
+digests for the signer and agent allowlists. Keep `ca.key` offline after issuing
+the deployment certificates. Certificate bootstrap requires Linux `b2sum`
+because BLAKE2b-256 is not a truncation of BLAKE2b-512.
 
 Compute exact profile and transport-key digests with `b2sum -l 256`. Create
 service accounts and state/config directories with mode `0700`; private keys,
