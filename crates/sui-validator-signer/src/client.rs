@@ -311,6 +311,7 @@ mod tests {
     use consensus_core::{TestBlock, consensus_block_signing_payload, serialize_consensus_block};
     use fastcrypto::{
         groups::bls12381,
+        hash::{Blake2b256, HashFunction as _},
         serde_helpers::ToFromByteArray as _,
         traits::{KeyPair as _, ToFromBytes as _, VerifyingKey as _},
     };
@@ -378,12 +379,22 @@ mod tests {
             &ca_certificate,
             &ca_key,
         );
+        let (status_certificate, status_key) = end_entity(
+            "controller-status-reader",
+            ExtendedKeyUsagePurpose::ClientAuth,
+            &ca_certificate,
+            &ca_key,
+        );
         let ca_path = directory.path().join("ca.pem");
         let client_certificate_path = directory.path().join("client.pem");
         let client_private_key_path = directory.path().join("client.key");
+        let status_certificate_path = directory.path().join("status.pem");
+        let status_private_key_path = directory.path().join("status.key");
         fs::write(&ca_path, ca_certificate.pem()).unwrap();
         fs::write(&client_certificate_path, client_certificate.pem()).unwrap();
         write_private(&client_private_key_path, &client_key.serialize_pem());
+        fs::write(&status_certificate_path, status_certificate.pem()).unwrap();
+        write_private(&status_private_key_path, &status_key.serialize_pem());
 
         let (_, protocol) = get_authority_key_pair();
         let (_, worker): (_, NetworkKeyPair) = get_key_pair();
@@ -399,6 +410,17 @@ mod tests {
         )
         .unwrap();
         let service = SignerService::new(
+            crate::service::SignerAccessPolicy::new(
+                std::collections::BTreeSet::from([Blake2b256::digest(
+                    client_certificate.der().as_ref(),
+                )
+                .into()]),
+                std::collections::BTreeSet::from([Blake2b256::digest(
+                    status_certificate.der().as_ref(),
+                )
+                .into()]),
+            )
+            .unwrap(),
             policy,
             SignerKeys::new(protocol, worker),
             [7; 32],
@@ -436,6 +458,25 @@ mod tests {
             lease_ttl_ms: 5_000,
         };
         let mut client = SignerRpcClient::connect(&config).await.unwrap();
+        let mut status_config = config.clone();
+        status_config.client_certificate_path = status_certificate_path;
+        status_config.client_private_key_path = status_private_key_path;
+        let mut status_client = SignerRpcClient::connect(&status_config).await.unwrap();
+        assert!(
+            status_client
+                .get_status()
+                .await
+                .unwrap()
+                .current_lease
+                .is_none()
+        );
+        assert!(matches!(
+            status_client.acquire_lease().await,
+            Err(ClientError::Rpc {
+                code: Code::PermissionDenied,
+                ..
+            })
+        ));
         let credential = client.acquire_lease().await.unwrap().credential;
         let block = TestBlock::new(2, 0).set_epoch(1).build();
         let serialized_block = serialize_consensus_block(&block).unwrap();

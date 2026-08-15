@@ -11,7 +11,7 @@ use sui_validator_signer::{
     config::{SignerConfig, ensure_private_directory, ensure_private_file},
     policy::{FileStateStore, SignerPolicy, SystemClock},
     rpc::ValidatorSignerServer,
-    service::{SignerKeys, SignerService},
+    service::{SignerAccessPolicy, SignerKeys, SignerService},
 };
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
@@ -64,6 +64,10 @@ async fn main() -> Result<()> {
         config.max_lease_ttl_ms,
     )?;
     let service = SignerService::new(
+        SignerAccessPolicy::new(
+            config.authorized_lease_holders()?,
+            config.authorized_status_readers()?,
+        )?,
         policy,
         SignerKeys::new(protocol, ProtocolKeyPair::new(worker)),
         config.parsed_chain_id()?,

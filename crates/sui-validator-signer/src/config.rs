@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::BTreeSet,
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use crate::protocol::ChainId;
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SignerConfig {
     pub listen_address: SocketAddr,
     pub state_path: PathBuf,
@@ -21,6 +22,9 @@ pub struct SignerConfig {
     pub protocol_key_path: PathBuf,
     pub worker_key_path: PathBuf,
     pub chain_id: String,
+    pub lease_holder_certificate_digests: Vec<String>,
+    #[serde(default)]
+    pub status_reader_certificate_digests: Vec<String>,
     #[serde(default = "default_max_lease_ttl_ms")]
     pub max_lease_ttl_ms: u64,
     #[serde(default = "default_max_payload_bytes")]
@@ -47,6 +51,12 @@ impl SignerConfig {
             config.max_payload_bytes > 0,
             "max payload size must be nonzero"
         );
+        ensure!(
+            !config.lease_holder_certificate_digests.is_empty(),
+            "at least one lease-holder certificate digest is required"
+        );
+        config.authorized_lease_holders()?;
+        config.authorized_status_readers()?;
         Ok(config)
     }
 
@@ -56,6 +66,37 @@ impl SignerConfig {
             .try_into()
             .map_err(|_| anyhow::anyhow!("chain-id must contain exactly 32 bytes"))
     }
+
+    pub fn authorized_lease_holders(&self) -> Result<BTreeSet<[u8; 32]>> {
+        parse_certificate_digests(
+            "lease-holder certificate digest",
+            &self.lease_holder_certificate_digests,
+        )
+    }
+
+    pub fn authorized_status_readers(&self) -> Result<BTreeSet<[u8; 32]>> {
+        parse_certificate_digests(
+            "status-reader certificate digest",
+            &self.status_reader_certificate_digests,
+        )
+    }
+}
+
+fn parse_certificate_digests(name: &str, digests: &[String]) -> Result<BTreeSet<[u8; 32]>> {
+    digests
+        .iter()
+        .map(|digest| {
+            ensure!(
+                digest == &digest.to_ascii_lowercase(),
+                "{name} must be lowercase"
+            );
+            let bytes =
+                hex::decode(digest).with_context(|| format!("{name} must be hexadecimal"))?;
+            bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("{name} must contain exactly 32 bytes"))
+        })
+        .collect()
 }
 
 const fn default_max_lease_ttl_ms() -> u64 {

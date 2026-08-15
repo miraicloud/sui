@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use consensus_config::ProtocolKeyPair;
 use consensus_core::{
@@ -31,6 +31,44 @@ pub struct SignerKeys {
     worker: ProtocolKeyPair,
 }
 
+#[derive(Clone, Debug)]
+pub struct SignerAccessPolicy {
+    lease_holders: BTreeSet<HolderId>,
+    status_readers: BTreeSet<HolderId>,
+}
+
+impl SignerAccessPolicy {
+    pub fn new(
+        lease_holders: BTreeSet<HolderId>,
+        status_readers: BTreeSet<HolderId>,
+    ) -> Result<Self, AccessPolicyError> {
+        if lease_holders.is_empty() {
+            return Err(AccessPolicyError::NoLeaseHolders);
+        }
+        Ok(Self {
+            lease_holders,
+            status_readers,
+        })
+    }
+
+    fn authorize(&self, holder_id: HolderId, request: &RequestV1) -> Result<(), ServiceError> {
+        if is_read_only(request) {
+            if self.lease_holders.contains(&holder_id) || self.status_readers.contains(&holder_id) {
+                return Ok(());
+            }
+            return Err(ServiceError::ReadAccessDenied);
+        }
+        if self.lease_holders.contains(&holder_id) {
+            return Ok(());
+        }
+        Err(ServiceError::SigningAccessDenied)
+    }
+}
+
+fn is_read_only(request: &RequestV1) -> bool {
+    matches!(request, RequestV1::GetPublicKeys | RequestV1::GetStatus)
+}
+
 impl SignerKeys {
     pub fn new(protocol: AuthorityKeyPair, worker: ProtocolKeyPair) -> Self {
         Self { protocol, worker }
@@ -46,6 +84,7 @@ impl SignerKeys {
 
 #[derive(Clone)]
 pub struct SignerService {
+    access: SignerAccessPolicy,
     policy: Arc<SignerPolicy<FileStateStore, SystemClock>>,
     keys: Arc<SignerKeys>,
     chain_id: ChainId,
@@ -55,6 +94,7 @@ pub struct SignerService {
 
 impl SignerService {
     pub fn new(
+        access: SignerAccessPolicy,
         policy: SignerPolicy<FileStateStore, SystemClock>,
         keys: SignerKeys,
         chain_id: ChainId,
@@ -67,6 +107,7 @@ impl SignerService {
             keys.protocol.copy(),
         )?;
         Ok(Self {
+            access,
             policy: Arc::new(policy),
             keys: Arc::new(keys),
             chain_id,
@@ -87,6 +128,7 @@ impl SignerService {
         holder_id: HolderId,
         request: RequestV1,
     ) -> Result<ResponseV1, ServiceError> {
+        self.access.authorize(holder_id, &request)?;
         match request {
             RequestV1::GetPublicKeys => Ok(self.keys.public_keys()),
             RequestV1::GetStatus => {
@@ -269,6 +311,12 @@ impl SignerService {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum AccessPolicyError {
+    #[error("at least one lease holder must be authorized")]
+    NoLeaseHolders,
+}
+
 impl From<crate::randomness::DkgSessionStatus> for DkgSessionStatus {
     fn from(status: crate::randomness::DkgSessionStatus) -> Self {
         Self {
@@ -344,6 +392,10 @@ fn authenticated_holder_id(request: &TonicRequest<RpcRequest>) -> Result<HolderI
 
 #[derive(Debug, Error)]
 enum ServiceError {
+    #[error("client certificate is not authorized to read signer status")]
+    ReadAccessDenied,
+    #[error("client certificate is not authorized to acquire a lease or sign")]
+    SigningAccessDenied,
     #[error("authenticated client does not match lease holder")]
     ClientIdentityMismatch,
     #[error("request chain does not match signer configuration")]
@@ -373,7 +425,9 @@ enum ServiceError {
 impl From<ServiceError> for Status {
     fn from(error: ServiceError) -> Self {
         match error {
-            ServiceError::ClientIdentityMismatch => Status::permission_denied(error.to_string()),
+            ServiceError::ReadAccessDenied
+            | ServiceError::SigningAccessDenied
+            | ServiceError::ClientIdentityMismatch => Status::permission_denied(error.to_string()),
             ServiceError::ChainMismatch
             | ServiceError::InvalidPayloadSize
             | ServiceError::TypedRandomnessOperationRequired
@@ -484,6 +538,8 @@ mod tests {
             Self {
                 _directory: directory,
                 service: SignerService::new(
+                    SignerAccessPolicy::new(BTreeSet::from([[1; 32], [2; 32]]), BTreeSet::new())
+                        .unwrap(),
                     policy,
                     SignerKeys::new(protocol, worker),
                     [7; 32],
