@@ -33,3 +33,7 @@ telemetry-subscribers.workspace = true
 
 [target.'cfg(msim)'.dependencies]
 sui-simulator.workspace = true
+
+[dev-dependencies]
+consensus-config.workspace = true
+reqwest.workspace = true

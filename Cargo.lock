@@ -17261,11 +17261,13 @@ name = "sui-swarm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "consensus-config",
  "futures",
  "mysten-metrics",
  "mysten-network",
  "prometheus",
  "rand 0.8.5",
+ "reqwest",
  "sui-config",
  "sui-macros",
  "sui-node",
