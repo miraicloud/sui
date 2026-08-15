@@ -26,6 +26,11 @@ command -v tar >/dev/null
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
+target_dir=${CARGO_TARGET_DIR:-target}
+case $target_dir in
+    /*) ;;
+    *) target_dir="$repo_root/$target_dir" ;;
+esac
 [[ -z $(git status --porcelain) ]] || {
     echo "refusing to build from a dirty worktree" >&2
     exit 1
@@ -66,7 +71,7 @@ binaries=(
     sui-validator-control
 )
 for binary in "${binaries[@]}"; do
-    install -m 0755 "target/release/$binary" "$stage/bin/$binary"
+    install -m 0755 "$target_dir/release/$binary" "$stage/bin/$binary"
 done
 install -m 0644 crates/sui-validator-failover/deploy/*.yaml.example "$stage/config/"
 install -m 0644 crates/sui-validator-failover/deploy/*.service "$stage/systemd/"
