@@ -20,9 +20,9 @@ jobs:
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: 4
-      CARGO_INCREMENTAL: 0
-      CARGO_TARGET_DIR: ${{ runner.temp }}/tomodachi-target
-      OUTPUT_DIR: ${{ runner.temp }}/tomodachi-artifacts
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: /tmp/tomodachi-target
+      OUTPUT_DIR: /tmp/tomodachi-artifacts
       RUST_BACKTRACE: 1
 
     steps:
@@ -55,5 +55,5 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: |
-            ${{ runner.temp }}/tomodachi-artifacts/*.tar.gz
-            ${{ runner.temp }}/tomodachi-artifacts/*.sha256
+            /tmp/tomodachi-artifacts/*.tar.gz
+            /tmp/tomodachi-artifacts/*.sha256
