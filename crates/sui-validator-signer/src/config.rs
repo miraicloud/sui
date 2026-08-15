@@ -17,6 +17,7 @@ use crate::protocol::ChainId;
 pub struct SignerConfig {
     pub listen_address: SocketAddr,
     pub state_path: PathBuf,
+    pub randomness_state_path: PathBuf,
     pub protocol_key_path: PathBuf,
     pub worker_key_path: PathBuf,
     pub chain_id: String,

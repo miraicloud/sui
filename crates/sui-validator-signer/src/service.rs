@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use consensus_config::ProtocolKeyPair;
 use consensus_core::{
@@ -11,7 +11,7 @@ use fastcrypto::{
     hash::{Blake2b256, HashFunction},
     traits::{KeyPair as _, Signer as _, ToFromBytes as _},
 };
-use sui_types::crypto::{AuthorityKeyPair, AuthoritySignature};
+use sui_types::crypto::{AuthorityKeyPair, AuthoritySignature, RandomnessRound};
 use thiserror::Error;
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status};
 
@@ -19,8 +19,10 @@ use crate::{
     authority_payload::{AuthorityPayloadError, classify_authority_payload},
     policy::{FileStateStore, PolicyError, SignerPolicy, SystemClock},
     protocol::{
-        ChainId, HolderId, LeaseCredential, OperationKey, Request, RequestV1, Response, ResponseV1,
+        ChainId, DkgSessionStatus, HolderId, LeaseCredential, OperationKey, RandomnessDkgRequest,
+        RandomnessDkgResponse, Request, RequestV1, Response, ResponseV1,
     },
+    randomness::{FileRandomnessStateStore, RandomnessError, RandomnessSessionManager},
     rpc::{RpcRequest, RpcResponse, ValidatorSigner},
 };
 
@@ -48,6 +50,7 @@ pub struct SignerService {
     keys: Arc<SignerKeys>,
     chain_id: ChainId,
     max_payload_bytes: usize,
+    randomness: Arc<RandomnessSessionManager<FileRandomnessStateStore>>,
 }
 
 impl SignerService {
@@ -56,13 +59,20 @@ impl SignerService {
         keys: SignerKeys,
         chain_id: ChainId,
         max_payload_bytes: usize,
-    ) -> Self {
-        Self {
+        randomness_state_path: impl Into<PathBuf>,
+    ) -> Result<Self, RandomnessError> {
+        let randomness = RandomnessSessionManager::open(
+            FileRandomnessStateStore::new(randomness_state_path),
+            chain_id,
+            keys.protocol.copy(),
+        )?;
+        Ok(Self {
             policy: Arc::new(policy),
             keys: Arc::new(keys),
             chain_id,
             max_payload_bytes,
-        }
+            randomness: Arc::new(randomness),
+        })
     }
 
     fn handle(&self, holder_id: HolderId, request: Request) -> Result<Response, ServiceError> {
@@ -109,7 +119,111 @@ impl SignerService {
                 )?;
                 Ok(ResponseV1::Signature(signature))
             }
+            RequestV1::RandomnessDkg {
+                credential,
+                chain_id,
+                request,
+            } => {
+                verify_holder(holder_id, &credential)?;
+                self.verify_chain(chain_id)?;
+                let response = self
+                    .policy
+                    .execute_with_lease(&credential, || self.handle_randomness_dkg(request))??;
+                Ok(ResponseV1::RandomnessDkg(response))
+            }
+            RequestV1::RandomnessPartialSign {
+                credential,
+                chain_id,
+                epoch,
+                round,
+            } => {
+                verify_holder(holder_id, &credential)?;
+                self.verify_chain(chain_id)?;
+                let operation = OperationKey::RandomnessPartialSignature {
+                    chain_id,
+                    epoch,
+                    round,
+                };
+                let payload = RandomnessRound(round).signature_message();
+                let digest = Blake2b256::digest(&payload).into();
+                let randomness = self.randomness.clone();
+                let signatures = self.policy.authorize_and_execute(
+                    &credential,
+                    operation,
+                    digest,
+                    move || {
+                        randomness
+                            .partial_sign(epoch, RandomnessRound(round))
+                            .map_err(|error| error.to_string())
+                    },
+                )?;
+                Ok(ResponseV1::RandomnessPartialSignatures(signatures))
+            }
         }
+    }
+
+    fn verify_chain(&self, chain_id: ChainId) -> Result<(), ServiceError> {
+        if chain_id != self.chain_id {
+            return Err(ServiceError::ChainMismatch);
+        }
+        Ok(())
+    }
+
+    fn handle_randomness_dkg(
+        &self,
+        request: RandomnessDkgRequest,
+    ) -> Result<RandomnessDkgResponse, ServiceError> {
+        match request {
+            RandomnessDkgRequest::Initialize {
+                epoch,
+                nodes,
+                threshold,
+            } => {
+                self.verify_randomness_payload(&nodes)?;
+                let status = self.randomness.initialize(epoch, &nodes, threshold)?;
+                Ok(RandomnessDkgResponse::Status(status.into()))
+            }
+            RandomnessDkgRequest::GetStatus { epoch } => Ok(RandomnessDkgResponse::Status(
+                self.randomness.status(epoch)?.into(),
+            )),
+            RandomnessDkgRequest::CreateMessage { epoch } => Ok(RandomnessDkgResponse::Message(
+                self.randomness.create_message(epoch)?,
+            )),
+            RandomnessDkgRequest::ProcessMessage { epoch, message } => {
+                self.verify_randomness_payload(&message)?;
+                let sender = self.randomness.process_message(epoch, &message)?;
+                Ok(RandomnessDkgResponse::MessageProcessed { sender })
+            }
+            RandomnessDkgRequest::TryMerge { epoch } => {
+                let merged = self.randomness.try_merge(epoch)?;
+                Ok(RandomnessDkgResponse::Merged {
+                    confirmation: merged.confirmation,
+                    used_messages: merged.used_messages,
+                })
+            }
+            RandomnessDkgRequest::AddConfirmation {
+                epoch,
+                confirmation,
+            } => {
+                self.verify_randomness_payload(&confirmation)?;
+                let sender = self.randomness.add_confirmation(epoch, &confirmation)?;
+                Ok(RandomnessDkgResponse::ConfirmationProcessed { sender })
+            }
+            RandomnessDkgRequest::TryComplete { epoch } => {
+                let completed = self.randomness.try_complete(epoch)?;
+                Ok(RandomnessDkgResponse::Complete {
+                    public_output: completed.public_output,
+                    threshold: completed.threshold,
+                })
+            }
+        }
+    }
+
+    fn verify_randomness_payload(&self, payload: &[u8]) -> Result<(), ServiceError> {
+        if payload.is_empty() || payload.len() > self.max_payload_bytes {
+            return Err(ServiceError::InvalidPayloadSize);
+        }
+        Ok(())
     }
 
     fn verify_signing_request(
@@ -143,6 +257,20 @@ impl SignerService {
             }
         }
         Ok(())
+    }
+}
+
+impl From<crate::randomness::DkgSessionStatus> for DkgSessionStatus {
+    fn from(status: crate::randomness::DkgSessionStatus) -> Self {
+        Self {
+            epoch: status.epoch,
+            party_id: status.party_id,
+            threshold: status.threshold,
+            processed_messages: status.processed_messages as u64,
+            confirmations: status.confirmations as u64,
+            merged: status.merged,
+            shares_ready: status.shares_ready,
+        }
     }
 }
 
@@ -229,6 +357,8 @@ enum ServiceError {
     Encode(bcs::Error),
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    #[error(transparent)]
+    Randomness(#[from] RandomnessError),
 }
 
 impl From<ServiceError> for Status {
@@ -243,6 +373,18 @@ impl From<ServiceError> for Status {
             | ServiceError::ConsensusBlock(_)
             | ServiceError::AuthorityPayload(_)
             | ServiceError::Decode(_) => Status::invalid_argument(error.to_string()),
+            ServiceError::Randomness(
+                RandomnessError::UnknownEpoch(_)
+                | RandomnessError::SessionMismatch(_)
+                | RandomnessError::SessionSealed(_)
+                | RandomnessError::NotMerged(_)
+                | RandomnessError::SharesUnavailable(_)
+                | RandomnessError::ConflictingMessage(_)
+                | RandomnessError::ConflictingConfirmation(_)
+                | RandomnessError::UnsupportedDkgVersion
+                | RandomnessError::Crypto(_)
+                | RandomnessError::Deserialize(_),
+            ) => Status::failed_precondition(error.to_string()),
             ServiceError::Policy(
                 PolicyError::NoLease
                 | PolicyError::LeaseExpired
@@ -253,6 +395,18 @@ impl From<ServiceError> for Status {
                 PolicyError::LeaseHeld { .. } | PolicyError::Equivocation | PolicyError::InvalidTtl,
             ) => Status::failed_precondition(error.to_string()),
             ServiceError::Encode(_)
+            | ServiceError::Randomness(
+                RandomnessError::ChainMismatch
+                | RandomnessError::InvalidProtocolKey
+                | RandomnessError::UnsupportedStateVersion(_)
+                | RandomnessError::LockPoisoned
+                | RandomnessError::InvalidStatePath(_)
+                | RandomnessError::CorruptState(_)
+                | RandomnessError::InvalidStateFile(_)
+                | RandomnessError::Serialize(_)
+                | RandomnessError::Rng(_)
+                | RandomnessError::Io(_),
+            )
             | ServiceError::Policy(
                 PolicyError::ClockBeforeUnixEpoch
                 | PolicyError::ClockOverflow
@@ -277,7 +431,12 @@ impl From<ServiceError> for Status {
 mod tests {
     use consensus_config::{ProtocolKeySignature, ProtocolPublicKey};
     use consensus_core::{TestBlock, consensus_block_signing_payload, serialize_consensus_block};
-    use fastcrypto::traits::{ToFromBytes as _, VerifyingKey as _};
+    use fastcrypto::{
+        groups::bls12381,
+        serde_helpers::ToFromByteArray as _,
+        traits::{ToFromBytes as _, VerifyingKey as _},
+    };
+    use fastcrypto_tbls::{ecies_v1, nodes::Node, nodes::Nodes};
     use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
     use sui_types::crypto::{
         AuthorityPublicKey, NetworkKeyPair, get_authority_key_pair, get_key_pair,
@@ -286,7 +445,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::protocol::{LeaseGrant, Request, RequestV1, Response};
+    use crate::protocol::{
+        LeaseGrant, RandomnessDkgRequest, RandomnessDkgResponse, Request, RequestV1, Response,
+    };
 
     struct Fixture {
         _directory: TempDir,
@@ -309,6 +470,7 @@ mod tests {
                 10_000,
             )
             .unwrap();
+            let randomness_state_path = directory.path().join("randomness.bcs");
             Self {
                 _directory: directory,
                 service: SignerService::new(
@@ -316,7 +478,9 @@ mod tests {
                     SignerKeys::new(protocol, worker),
                     [7; 32],
                     1_024,
-                ),
+                    randomness_state_path,
+                )
+                .unwrap(),
                 protocol_public,
                 worker_public,
             }
@@ -486,5 +650,102 @@ mod tests {
             ),
             Err(ServiceError::TypedRandomnessOperationRequired)
         ));
+    }
+
+    #[test]
+    fn dkg_api_is_lease_and_chain_fenced() {
+        let fixture = Fixture::new();
+        let holder_id = [1; 32];
+        let credential = fixture.acquire(holder_id);
+        let mut public_keys = vec![fixture.protocol_public.clone()];
+        public_keys.extend((0..3).map(|_| {
+            let (_, key) = get_authority_key_pair();
+            key.public().clone()
+        }));
+        let nodes = Nodes::new(
+            public_keys
+                .iter()
+                .enumerate()
+                .map(|(id, public_key)| {
+                    let public = bls12381::G2Element::from_byte_array(
+                        public_key.as_bytes().try_into().unwrap(),
+                    )
+                    .unwrap();
+                    Node {
+                        id: id.try_into().unwrap(),
+                        pk: ecies_v1::PublicKey::from(public),
+                        weight: 1,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let initialize = RandomnessDkgRequest::Initialize {
+            epoch: 9,
+            nodes: bcs::to_bytes(&nodes).unwrap(),
+            threshold: 2,
+        };
+
+        assert!(matches!(
+            fixture.service.handle(
+                [2; 32],
+                Request::V1(RequestV1::RandomnessDkg {
+                    credential: credential.clone(),
+                    chain_id: [7; 32],
+                    request: initialize.clone(),
+                }),
+            ),
+            Err(ServiceError::ClientIdentityMismatch)
+        ));
+        assert!(matches!(
+            fixture.service.handle(
+                holder_id,
+                Request::V1(RequestV1::RandomnessDkg {
+                    credential: credential.clone(),
+                    chain_id: [8; 32],
+                    request: initialize.clone(),
+                }),
+            ),
+            Err(ServiceError::ChainMismatch)
+        ));
+
+        let response = fixture
+            .service
+            .handle(
+                holder_id,
+                Request::V1(RequestV1::RandomnessDkg {
+                    credential: credential.clone(),
+                    chain_id: [7; 32],
+                    request: initialize,
+                }),
+            )
+            .unwrap();
+        let Response::V1(ResponseV1::RandomnessDkg(RandomnessDkgResponse::Status(status))) =
+            response
+        else {
+            panic!("unexpected response")
+        };
+        assert_eq!(status.party_id, 0);
+        assert!(!status.shares_ready);
+
+        let response = fixture
+            .service
+            .handle(
+                holder_id,
+                Request::V1(RequestV1::RandomnessDkg {
+                    credential,
+                    chain_id: [7; 32],
+                    request: RandomnessDkgRequest::CreateMessage { epoch: 9 },
+                }),
+            )
+            .unwrap();
+        let Response::V1(ResponseV1::RandomnessDkg(RandomnessDkgResponse::Message(message))) =
+            response
+        else {
+            panic!("unexpected response")
+        };
+        let message: sui_types::messages_consensus::VersionedDkgMessage =
+            bcs::from_bytes(&message).unwrap();
+        assert_eq!(message.sender(), 0);
     }
 }

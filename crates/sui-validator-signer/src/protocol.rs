@@ -40,6 +40,66 @@ pub struct LeaseStatus {
     pub expires_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DkgSessionStatus {
+    pub epoch: u64,
+    pub party_id: u16,
+    pub threshold: u16,
+    pub processed_messages: u64,
+    pub confirmations: u64,
+    pub merged: bool,
+    pub shares_ready: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RandomnessDkgRequest {
+    Initialize {
+        epoch: u64,
+        nodes: Vec<u8>,
+        threshold: u16,
+    },
+    GetStatus {
+        epoch: u64,
+    },
+    CreateMessage {
+        epoch: u64,
+    },
+    ProcessMessage {
+        epoch: u64,
+        message: Vec<u8>,
+    },
+    TryMerge {
+        epoch: u64,
+    },
+    AddConfirmation {
+        epoch: u64,
+        confirmation: Vec<u8>,
+    },
+    TryComplete {
+        epoch: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RandomnessDkgResponse {
+    Status(DkgSessionStatus),
+    Message(Vec<u8>),
+    MessageProcessed {
+        sender: u16,
+    },
+    Merged {
+        confirmation: Vec<u8>,
+        used_messages: Vec<Vec<u8>>,
+    },
+    ConfirmationProcessed {
+        sender: u16,
+    },
+    Complete {
+        public_output: Vec<u8>,
+        threshold: u16,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum OperationKey {
     ConsensusBlock {
@@ -111,6 +171,17 @@ pub enum RequestV1 {
         payload: Vec<u8>,
     },
     GetStatus,
+    RandomnessDkg {
+        credential: LeaseCredential,
+        chain_id: ChainId,
+        request: RandomnessDkgRequest,
+    },
+    RandomnessPartialSign {
+        credential: LeaseCredential,
+        chain_id: ChainId,
+        epoch: u64,
+        round: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -128,4 +199,6 @@ pub enum ResponseV1 {
     Released,
     Signature(Vec<u8>),
     Status(SignerStatus),
+    RandomnessDkg(RandomnessDkgResponse),
+    RandomnessPartialSignatures(Vec<u8>),
 }

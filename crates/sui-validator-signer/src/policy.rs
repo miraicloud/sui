@@ -411,6 +411,43 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
         Ok(result)
     }
 
+    /// Runs a typed signer operation while holding the lease fence for its full duration.
+    ///
+    /// The nested result keeps policy failures separate from operation failures so callers can
+    /// preserve useful protocol error codes. The lease is checked both before and after execution;
+    /// a result produced after expiry is never returned to the client.
+    pub fn execute_with_lease<T, E, F>(
+        &self,
+        credential: &LeaseCredential,
+        execute: F,
+    ) -> Result<Result<T, E>, PolicyError>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        let now = self.clock.unix_ms()?;
+        let mut state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
+        validate_time(&state, now)?;
+        valid_lease(&state, credential, now)?;
+
+        let update = StateUpdate {
+            version: state.version,
+            next_generation: state.next_generation,
+            last_seen_unix_ms: now,
+            current_lease: state.current_lease.clone(),
+            decision: None,
+        };
+        self.store.save(&update)?;
+        state.last_seen_unix_ms = now;
+
+        let result = execute();
+        let completed_at = self.clock.unix_ms()?;
+        if completed_at < state.last_seen_unix_ms {
+            return Err(PolicyError::ClockMovedBackwards);
+        }
+        valid_lease(&state, credential, completed_at)?;
+        Ok(result)
+    }
+
     fn validate_ttl(&self, ttl_ms: u64) -> Result<(), PolicyError> {
         if ttl_ms == 0 || ttl_ms > self.max_ttl_ms {
             return Err(PolicyError::InvalidTtl);
@@ -744,6 +781,23 @@ mod tests {
             policy.authorize_and_execute(&credential, block(11), [2; 32], || Ok(vec![1])),
             Err(PolicyError::Equivocation)
         ));
+    }
+
+    #[test]
+    fn typed_operation_result_is_discarded_after_lease_expiry() {
+        let clock = TestClock::default();
+        clock.set(100);
+        let policy =
+            SignerPolicy::open(Arc::new(FailingStore::default()), clock.clone(), MAX_TTL_MS)
+                .unwrap();
+        let grant = policy.acquire(holder(1), 100).unwrap();
+        let credential = credential(holder(1), &grant);
+
+        let result = policy.execute_with_lease(&credential, || {
+            clock.set(200);
+            Ok::<_, ()>(7)
+        });
+        assert!(matches!(result, Err(PolicyError::LeaseExpired)));
     }
 
     #[test]

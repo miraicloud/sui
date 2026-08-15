@@ -13,7 +13,8 @@ use tonic::{
 use crate::{
     config::ensure_private_file,
     protocol::{
-        LeaseCredential, OperationKey, Request, RequestV1, Response, ResponseV1, SignerStatus,
+        ChainId, LeaseCredential, OperationKey, RandomnessDkgRequest, RandomnessDkgResponse,
+        Request, RequestV1, Response, ResponseV1, SignerStatus,
     },
     rpc::{RpcRequest, ValidatorSignerClient},
 };
@@ -202,6 +203,46 @@ impl SignerRpcClient {
         }
     }
 
+    pub async fn randomness_dkg(
+        &mut self,
+        credential: LeaseCredential,
+        chain_id: ChainId,
+        request: RandomnessDkgRequest,
+    ) -> Result<RandomnessDkgResponse, ClientError> {
+        match self
+            .call(RequestV1::RandomnessDkg {
+                credential,
+                chain_id,
+                request,
+            })
+            .await?
+        {
+            ResponseV1::RandomnessDkg(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn randomness_partial_sign(
+        &mut self,
+        credential: LeaseCredential,
+        chain_id: ChainId,
+        epoch: u64,
+        round: u64,
+    ) -> Result<Vec<u8>, ClientError> {
+        match self
+            .call(RequestV1::RandomnessPartialSign {
+                credential,
+                chain_id,
+                epoch,
+                round,
+            })
+            .await?
+        {
+            ResponseV1::RandomnessPartialSignatures(signatures) => Ok(signatures),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     async fn call(&mut self, request: RequestV1) -> Result<ResponseV1, ClientError> {
         let body = bcs::to_bytes(&Request::V1(request)).map_err(ClientError::Encode)?;
         let rpc = self.inner.execute(RpcRequest { body });
@@ -352,7 +393,14 @@ mod tests {
             10_000,
         )
         .unwrap();
-        let service = SignerService::new(policy, SignerKeys::new(protocol, worker), [7; 32], 1_024);
+        let service = SignerService::new(
+            policy,
+            SignerKeys::new(protocol, worker),
+            [7; 32],
+            1_024,
+            directory.path().join("randomness.bcs"),
+        )
+        .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let tls = ServerTlsConfig::new()

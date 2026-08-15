@@ -39,6 +39,11 @@ async fn main() -> Result<()> {
         .parent()
         .context("state-path must have a parent directory")?;
     ensure_private_directory(state_directory)?;
+    let randomness_state_directory = config
+        .randomness_state_path
+        .parent()
+        .context("randomness-state-path must have a parent directory")?;
+    ensure_private_directory(randomness_state_directory)?;
 
     let protocol =
         read_authority_keypair_from_file(&config.protocol_key_path).with_context(|| {
@@ -63,7 +68,8 @@ async fn main() -> Result<()> {
         SignerKeys::new(protocol, ProtocolKeyPair::new(worker)),
         config.parsed_chain_id()?,
         config.max_payload_bytes,
-    );
+        &config.randomness_state_path,
+    )?;
 
     let certificate = fs::read(&config.tls.certificate_path).with_context(|| {
         format!(
