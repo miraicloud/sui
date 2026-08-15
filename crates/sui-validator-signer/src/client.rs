@@ -309,7 +309,12 @@ mod tests {
 
     use consensus_config::ProtocolKeyPair;
     use consensus_core::{TestBlock, consensus_block_signing_payload, serialize_consensus_block};
-    use fastcrypto::traits::{KeyPair as _, ToFromBytes as _, VerifyingKey as _};
+    use fastcrypto::{
+        groups::bls12381,
+        serde_helpers::ToFromByteArray as _,
+        traits::{KeyPair as _, ToFromBytes as _, VerifyingKey as _},
+    };
+    use fastcrypto_tbls::{ecies_v1, nodes::Node, nodes::Nodes};
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -483,6 +488,59 @@ mod tests {
                 &block_signature,
             )
             .unwrap();
+        let mut dkg_public_keys = vec![protocol_public.clone()];
+        dkg_public_keys.extend((0..3).map(|_| {
+            let (_, key) = get_authority_key_pair();
+            key.public().clone()
+        }));
+        let nodes = Nodes::new(
+            dkg_public_keys
+                .iter()
+                .enumerate()
+                .map(|(id, public_key)| {
+                    let public = bls12381::G2Element::from_byte_array(
+                        public_key.as_bytes().try_into().unwrap(),
+                    )
+                    .unwrap();
+                    Node {
+                        id: id.try_into().unwrap(),
+                        pk: ecies_v1::PublicKey::from(public),
+                        weight: 1,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (response, message_response) = tokio::task::spawn_blocking({
+            let blocking = blocking.clone();
+            move || {
+                let response = blocking
+                    .randomness_dkg(RandomnessDkgRequest::Initialize {
+                        epoch: 1,
+                        nodes: bcs::to_bytes(&nodes).unwrap(),
+                        threshold: 2,
+                    })
+                    .unwrap();
+                let message = blocking
+                    .randomness_dkg(RandomnessDkgRequest::CreateMessage { epoch: 1 })
+                    .unwrap();
+                (response, message)
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            RandomnessDkgResponse::Status(crate::protocol::DkgSessionStatus {
+                party_id: 0,
+                shares_ready: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            message_response,
+            RandomnessDkgResponse::Message(_)
+        ));
         let mut payload = bcs::to_bytes(&IntentMessage::new(
             Intent::sui_app(IntentScope::TransactionEffects),
             TransactionEffects::default(),

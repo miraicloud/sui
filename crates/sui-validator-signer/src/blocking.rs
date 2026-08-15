@@ -20,7 +20,7 @@ use tracing::warn;
 use crate::{
     authority_payload::{AuthorityPayloadError, classify_authority_payload},
     client::{ClientError, ExternalSignerConfig, SignerRpcClient},
-    protocol::ChainId,
+    protocol::{ChainId, RandomnessDkgRequest, RandomnessDkgResponse},
 };
 
 const COMMAND_CAPACITY: usize = 256;
@@ -120,6 +120,44 @@ impl BlockingValidatorSigner {
             .map_err(|_| BlockingSignerError::WorkerStopped)??;
         ProtocolKeySignature::from_bytes(&bytes).map_err(BlockingSignerError::InvalidSignature)
     }
+
+    pub fn randomness_dkg(
+        &self,
+        request: RandomnessDkgRequest,
+    ) -> Result<RandomnessDkgResponse, BlockingSignerError> {
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(BlockingSignerError::Standby)?
+            .blocking_send(Command::RandomnessDkg {
+                request,
+                response: sender,
+            })
+            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+        receiver
+            .recv()
+            .map_err(|_| BlockingSignerError::WorkerStopped)?
+    }
+
+    pub fn randomness_partial_sign(
+        &self,
+        epoch: u64,
+        round: u64,
+    ) -> Result<Vec<u8>, BlockingSignerError> {
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(BlockingSignerError::Standby)?
+            .blocking_send(Command::RandomnessPartialSign {
+                epoch,
+                round,
+                response: sender,
+            })
+            .map_err(|_| BlockingSignerError::WorkerStopped)?;
+        receiver
+            .recv()
+            .map_err(|_| BlockingSignerError::WorkerStopped)?
+    }
 }
 
 impl Signer<AuthoritySignature> for BlockingValidatorSigner {
@@ -148,6 +186,15 @@ enum Command {
     SignConsensusBlock {
         operation: crate::protocol::OperationKey,
         payload: Vec<u8>,
+        response: std_mpsc::SyncSender<Result<Vec<u8>, BlockingSignerError>>,
+    },
+    RandomnessDkg {
+        request: RandomnessDkgRequest,
+        response: std_mpsc::SyncSender<Result<RandomnessDkgResponse, BlockingSignerError>>,
+    },
+    RandomnessPartialSign {
+        epoch: u64,
+        round: u64,
         response: std_mpsc::SyncSender<Result<Vec<u8>, BlockingSignerError>>,
     },
 }
@@ -229,6 +276,29 @@ async fn run_async(
                     } => {
                         let result = client
                             .sign(credential.clone(), operation, payload)
+                            .await
+                            .map_err(BlockingSignerError::Client);
+                        let _ = response.send(result);
+                    }
+                    Command::RandomnessDkg { request, response } => {
+                        let result = client
+                            .randomness_dkg(credential.clone(), chain_id, request)
+                            .await
+                            .map_err(BlockingSignerError::Client);
+                        let _ = response.send(result);
+                    }
+                    Command::RandomnessPartialSign {
+                        epoch,
+                        round,
+                        response,
+                    } => {
+                        let result = client
+                            .randomness_partial_sign(
+                                credential.clone(),
+                                chain_id,
+                                epoch,
+                                round,
+                            )
                             .await
                             .map_err(BlockingSignerError::Client);
                         let _ = response.send(result);
