@@ -14545,6 +14545,7 @@ dependencies = [
  "starlark",
  "sui-keys",
  "sui-types",
+ "sui-validator-signer",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",

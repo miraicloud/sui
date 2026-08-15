@@ -34,6 +34,7 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::node_role::{FullNodeSyncMode, NodeRole};
 use sui_types::supported_protocol_versions::{Chain, SupportedProtocolVersions};
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
+use sui_validator_signer::client::ExternalSignerConfig;
 
 use sui_types::crypto::{AccountKeyPair, AuthorityKeyPair, get_key_pair_from_rng};
 use sui_types::multiaddr::Multiaddr;
@@ -68,6 +69,9 @@ pub struct NodeConfig {
     pub account_key_pair: KeyPairWithPath,
     #[serde(default = "default_key_pair")]
     pub network_key_pair: KeyPairWithPath,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_validator_signer: Option<ExternalSignerConfig>,
 
     pub db_path: PathBuf,
     #[serde(default = "default_grpc_address")]
@@ -1065,6 +1069,10 @@ impl Config for NodeConfig {}
 
 impl NodeConfig {
     pub fn protocol_key_pair(&self) -> &AuthorityKeyPair {
+        assert!(
+            self.external_validator_signer.is_none(),
+            "local protocol key access is forbidden when external-validator-signer is configured"
+        );
         self.protocol_key_pair.authority_keypair()
     }
 
@@ -1075,6 +1083,10 @@ impl NodeConfig {
     }
 
     pub fn worker_key_pair(&self) -> &NetworkKeyPair {
+        assert!(
+            self.external_validator_signer.is_none(),
+            "local worker key access is forbidden when external-validator-signer is configured"
+        );
         match self.worker_key_pair.keypair() {
             SuiKeyPair::Ed25519(kp) => kp,
             other => panic!(
@@ -1095,7 +1107,37 @@ impl NodeConfig {
     }
 
     pub fn protocol_public_key(&self) -> AuthorityPublicKeyBytes {
-        self.protocol_key_pair().public().into()
+        match &self.external_validator_signer {
+            Some(config) => {
+                use fastcrypto::traits::ToFromBytes as _;
+
+                let public_keys = config
+                    .expected_public_keys()
+                    .expect("external signer public keys must be valid");
+                AuthorityPublicKeyBytes::from_bytes(&public_keys.protocol_bls12381)
+                    .expect("external signer protocol public key must be valid")
+            }
+            None => self.protocol_key_pair().public().into(),
+        }
+    }
+
+    pub fn worker_public_key(&self) -> consensus_config::ProtocolPublicKey {
+        match &self.external_validator_signer {
+            Some(config) => {
+                use fastcrypto::traits::ToFromBytes as _;
+
+                let public_keys = config
+                    .expected_public_keys()
+                    .expect("external signer public keys must be valid");
+                let public_key =
+                    fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&public_keys.worker_ed25519)
+                        .expect("external signer worker public key must be valid");
+                consensus_config::ProtocolPublicKey::new(public_key)
+            }
+            None => {
+                consensus_config::ProtocolPublicKey::new(self.worker_key_pair().public().clone())
+            }
+        }
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -1981,10 +2023,15 @@ where
 mod tests {
     use std::path::PathBuf;
 
-    use fastcrypto::traits::KeyPair;
+    use fastcrypto::encoding::{Encoding, Hex};
+    use fastcrypto::traits::{KeyPair, ToFromBytes};
     use rand::{SeedableRng, rngs::StdRng};
     use sui_keys::keypair_file::{write_authority_keypair_to_file, write_keypair_to_file};
-    use sui_types::crypto::{AuthorityKeyPair, NetworkKeyPair, SuiKeyPair, get_key_pair_from_rng};
+    use sui_types::crypto::{
+        AuthorityKeyPair, AuthorityPublicKeyBytes, NetworkKeyPair, SuiKeyPair,
+        get_key_pair_from_rng,
+    };
+    use sui_validator_signer::client::ExternalSignerConfig;
 
     use super::{Genesis, StateArchiveConfig};
     use crate::NodeConfig;
@@ -2004,6 +2051,77 @@ mod tests {
         const TEMPLATE: &str = include_str!("../data/fullnode-template.yaml");
 
         let _template: NodeConfig = serde_yaml::from_str(TEMPLATE).unwrap();
+    }
+
+    #[test]
+    fn external_validator_signer_supplies_consensus_public_keys() {
+        const TEMPLATE: &str = include_str!("../data/fullnode-template.yaml");
+        let mut config: NodeConfig = serde_yaml::from_str(TEMPLATE).unwrap();
+        let protocol: AuthorityKeyPair = get_key_pair_from_rng(&mut StdRng::from_seed([1; 32])).1;
+        let worker: NetworkKeyPair = get_key_pair_from_rng(&mut StdRng::from_seed([2; 32])).1;
+        config.external_validator_signer = Some(ExternalSignerConfig {
+            endpoint: "https://127.0.0.1:18086".to_owned(),
+            server_name: "validator-signer.internal".to_owned(),
+            ca_certificate_path: PathBuf::from("/etc/sui/signer/ca.pem"),
+            client_certificate_path: PathBuf::from("/etc/sui/signer/client.pem"),
+            client_private_key_path: PathBuf::from("/etc/sui/signer/client.key"),
+            expected_protocol_public_key: Hex::encode(protocol.public().as_bytes()),
+            expected_worker_public_key: Hex::encode(worker.public().as_bytes()),
+            request_timeout_ms: 1_000,
+            lease_ttl_ms: 5_000,
+        });
+
+        assert_eq!(
+            config.protocol_public_key(),
+            AuthorityPublicKeyBytes::from(protocol.public())
+        );
+        assert_eq!(
+            config.worker_public_key().to_bytes(),
+            worker.public().as_bytes()
+        );
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let reparsed: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.protocol_public_key(), config.protocol_public_key());
+        assert_eq!(
+            reparsed.worker_public_key().to_bytes(),
+            config.worker_public_key().to_bytes()
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "local protocol key access is forbidden when external-validator-signer is configured"
+    )]
+    fn external_validator_signer_forbids_local_protocol_key_access() {
+        let config = external_signer_test_config();
+        config.protocol_key_pair();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "local worker key access is forbidden when external-validator-signer is configured"
+    )]
+    fn external_validator_signer_forbids_local_worker_key_access() {
+        let config = external_signer_test_config();
+        config.worker_key_pair();
+    }
+
+    fn external_signer_test_config() -> NodeConfig {
+        const TEMPLATE: &str = include_str!("../data/fullnode-template.yaml");
+        let mut config: NodeConfig = serde_yaml::from_str(TEMPLATE).unwrap();
+        config.external_validator_signer = Some(ExternalSignerConfig {
+            endpoint: "https://127.0.0.1:18086".to_owned(),
+            server_name: "validator-signer.internal".to_owned(),
+            ca_certificate_path: PathBuf::from("/etc/sui/signer/ca.pem"),
+            client_certificate_path: PathBuf::from("/etc/sui/signer/client.pem"),
+            client_private_key_path: PathBuf::from("/etc/sui/signer/client.key"),
+            expected_protocol_public_key: Hex::encode([1; 96]),
+            expected_worker_public_key: Hex::encode([2; 32]),
+            request_timeout_ms: 1_000,
+            lease_ttl_ms: 5_000,
+        });
+        config
     }
 
     /// Tests that a legacy validator config (captured on 12/06/2024) can be parsed.
