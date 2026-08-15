@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NodeProfile {
@@ -49,4 +51,31 @@ pub struct HostStatus {
     pub worker_public_key: String,
     pub network_public_key: String,
     pub operation: Option<OperationStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Request {
+    V1(RequestV1),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RequestV1 {
+    GetStatus,
+    Stop {
+        operation_id: String,
+    },
+    Activate {
+        operation_id: String,
+        profile: NodeProfile,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Response {
+    V1(ResponseV1),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ResponseV1 {
+    Status(HostStatus),
 }

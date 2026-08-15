@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, path::PathBuf};
+use std::{fs, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,53 @@ pub struct AgentConfig {
     pub protocol_public_key: String,
     pub worker_public_key: String,
     pub network_public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentDaemonConfig {
+    pub listen_address: SocketAddr,
+    pub agent: AgentConfig,
+    pub authorized_client_certificate_digests: Vec<String>,
+    pub tls: TlsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TlsConfig {
+    pub certificate_path: PathBuf,
+    pub private_key_path: PathBuf,
+    pub client_ca_path: PathBuf,
+}
+
+impl AgentDaemonConfig {
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read agent daemon config {}", path.display()))?;
+        let config: Self = serde_yaml::from_slice(&bytes)
+            .with_context(|| format!("failed to parse agent daemon config {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.agent.validate()?;
+        ensure!(
+            !self.authorized_client_certificate_digests.is_empty(),
+            "at least one authorized client certificate digest is required"
+        );
+        for digest in &self.authorized_client_certificate_digests {
+            validate_hex_key("authorized client certificate digest", digest, 32)?;
+        }
+        for (name, path) in [
+            ("tls.certificate-path", &self.tls.certificate_path),
+            ("tls.private-key-path", &self.tls.private_key_path),
+            ("tls.client-ca-path", &self.tls.client_ca_path),
+        ] {
+            ensure!(path.is_absolute(), "{name} must be absolute");
+        }
+        Ok(())
+    }
 }
 
 impl AgentConfig {
@@ -79,5 +126,26 @@ fn validate_hex_key(name: &str, value: &str, expected_bytes: usize) -> Result<()
         value == value.to_ascii_lowercase(),
         "{name} must be lowercase"
     );
+    Ok(())
+}
+
+pub fn ensure_private_file(path: &std::path::Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private file {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "private file {} must not be accessible by group or other users",
+            path.display()
+        );
+    }
     Ok(())
 }
