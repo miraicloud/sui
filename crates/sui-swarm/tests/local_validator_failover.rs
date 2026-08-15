@@ -76,8 +76,11 @@ async fn fenced_local_keys_support_reversible_mid_epoch_handoff() {
 
     // The target keeps its observer authority and consensus databases. Only
     // the cold-start profile and the three ordinary validator runtime keys
-    // change after the source has been fenced.
+    // change after the source has been fenced. Its independent account key is
+    // deliberately retained: the staking-account key is not a runtime
+    // consensus key and must not be copied to the standby.
     let mut target_validator_profile = source_validator_profile.clone();
+    target_validator_profile.account_key_pair = target_observer_profile.account_key_pair.clone();
     target_validator_profile.db_path = target_observer_profile.db_path.clone();
     target_validator_profile
         .consensus_config
