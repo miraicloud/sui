@@ -64,6 +64,12 @@ pub struct PublicKeys {
     pub worker_ed25519: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveLease {
+    pub credential: LeaseCredential,
+    pub expires_at_unix_ms: u64,
+}
+
 pub struct SignerRpcClient {
     inner: ValidatorSignerClient<Channel>,
     request_timeout: Duration,
@@ -116,23 +122,29 @@ impl SignerRpcClient {
         }
     }
 
-    pub async fn acquire_lease(&mut self) -> Result<LeaseCredential, ClientError> {
+    pub async fn acquire_lease(&mut self) -> Result<ActiveLease, ClientError> {
         match self
             .call(RequestV1::AcquireLease {
                 ttl_ms: self.lease_ttl_ms,
             })
             .await?
         {
-            ResponseV1::Lease(grant) => Ok(LeaseCredential {
-                holder_id: grant.holder_id,
-                generation: grant.generation,
-                lease_id: grant.lease_id,
+            ResponseV1::Lease(grant) => Ok(ActiveLease {
+                credential: LeaseCredential {
+                    holder_id: grant.holder_id,
+                    generation: grant.generation,
+                    lease_id: grant.lease_id,
+                },
+                expires_at_unix_ms: grant.expires_at_unix_ms,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
-    pub async fn renew_lease(&mut self, credential: &LeaseCredential) -> Result<(), ClientError> {
+    pub async fn renew_lease(
+        &mut self,
+        credential: &LeaseCredential,
+    ) -> Result<ActiveLease, ClientError> {
         match self
             .call(RequestV1::RenewLease {
                 credential: credential.clone(),
@@ -145,7 +157,10 @@ impl SignerRpcClient {
                     && grant.generation == credential.generation
                     && grant.lease_id == credential.lease_id =>
             {
-                Ok(())
+                Ok(ActiveLease {
+                    credential: credential.clone(),
+                    expires_at_unix_ms: grant.expires_at_unix_ms,
+                })
             }
             ResponseV1::Lease(_) => Err(ClientError::LeaseChangedDuringRenewal),
             _ => Err(ClientError::UnexpectedResponse),
@@ -243,18 +258,21 @@ mod tests {
     use std::fs;
 
     use consensus_config::ProtocolKeyPair;
-    use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
+    use fastcrypto::traits::{KeyPair as _, ToFromBytes as _, VerifyingKey as _};
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose,
     };
+    use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
     use sui_types::crypto::{NetworkKeyPair, get_authority_key_pair, get_key_pair};
+    use sui_types::effects::TransactionEffects;
     use tempfile::TempDir;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Identity, Server, ServerTlsConfig};
 
     use super::*;
     use crate::{
+        blocking::BlockingAuthoritySigner,
         policy::{FileStateStore, SignerPolicy, SystemClock},
         rpc::ValidatorSignerServer,
         service::{SignerKeys, SignerService},
@@ -314,6 +332,7 @@ mod tests {
         let (_, protocol) = get_authority_key_pair();
         let (_, worker): (_, NetworkKeyPair) = get_key_pair();
         let worker = ProtocolKeyPair::new(worker);
+        let protocol_public = protocol.public().clone();
         let expected_protocol_public_key = hex::encode(protocol.public().as_bytes());
         let expected_worker_public_key = hex::encode(worker.public().to_bytes());
         let policy = SignerPolicy::open(
@@ -353,7 +372,7 @@ mod tests {
             lease_ttl_ms: 5_000,
         };
         let mut client = SignerRpcClient::connect(&config).await.unwrap();
-        let credential = client.acquire_lease().await.unwrap();
+        let credential = client.acquire_lease().await.unwrap().credential;
         let signature = client
             .sign(
                 credential.clone(),
@@ -369,6 +388,29 @@ mod tests {
         assert!(!signature.is_empty());
         client.renew_lease(&credential).await.unwrap();
         client.release_lease(credential).await.unwrap();
+
+        let blocking = tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || BlockingAuthoritySigner::connect(config, [7; 32])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let mut payload = bcs::to_bytes(&IntentMessage::new(
+            Intent::sui_app(IntentScope::TransactionEffects),
+            TransactionEffects::default(),
+        ))
+        .unwrap();
+        payload.extend(bcs::to_bytes(&1_u64).unwrap());
+        let signed_payload = payload.clone();
+        let authority_signature =
+            tokio::task::spawn_blocking(move || blocking.sign_authority(&signed_payload))
+                .await
+                .unwrap()
+                .unwrap();
+        protocol_public
+            .verify(&payload, &authority_signature)
+            .unwrap();
         server.abort();
     }
 

@@ -4,6 +4,7 @@
 //! External validator signer protocol and fail-closed authorization policy.
 
 pub mod authority_payload;
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub mod policy;
