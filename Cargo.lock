@@ -17624,6 +17624,7 @@ name = "sui-validator-failover"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bcs",
  "clap",
  "fastcrypto",
@@ -17631,9 +17632,11 @@ dependencies = [
  "prost 0.14.1",
  "rand 0.8.5",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_yaml 0.8.26",
+ "sui-validator-signer",
  "telemetry-subscribers",
  "tempfile",
  "thiserror 1.0.69",

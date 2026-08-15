@@ -4,6 +4,8 @@
 pub mod agent;
 pub mod client;
 pub mod config;
+pub mod controller;
+pub mod metrics;
 pub mod protocol;
 pub mod rpc;
 pub mod service;

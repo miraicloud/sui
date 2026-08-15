@@ -15,17 +15,20 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 bcs.workspace = true
 clap.workspace = true
 fastcrypto.workspace = true
 hex.workspace = true
 prost.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 telemetry-subscribers.workspace = true
 thiserror.workspace = true
+sui-validator-signer.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true
 tonic-prost.workspace = true
