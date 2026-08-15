@@ -3,21 +3,24 @@
 
 use std::{
     collections::BTreeSet, fs, num::NonZeroUsize, os::unix::fs::PermissionsExt, path::Path,
-    time::Duration,
+    sync::Arc, time::Duration,
 };
 
-use consensus_config::ProtocolKeyPair;
+use consensus_config::{NetworkPublicKey, ObserverParameters, PeerRecord, ProtocolKeyPair};
 use fastcrypto::{
     hash::{Blake2b256, HashFunction},
     traits::{KeyPair as _, ToFromBytes as _},
 };
+use rand::rngs::OsRng;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 use sui_config::node::{AuthorityKeyPairWithPath, KeyPairWithPath};
 use sui_swarm::memory::Swarm;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
+use sui_swarm_config::node_config_builder::FullnodeConfigBuilder;
 use sui_types::crypto::{NetworkKeyPair, SuiKeyPair, get_authority_key_pair, get_key_pair};
+use sui_types::node_role::FullNodeSyncMode;
 use sui_validator_signer::{
     client::{ExternalSignerConfig, SignerRpcClient},
     policy::{FileStateStore, SignerPolicy, SystemClock},
@@ -29,7 +32,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_signing() {
+async fn consensus_observer_promotes_and_reverses_with_only_remote_signing() {
     telemetry_subscribers::init_for_testing();
     let directory = TempDir::new().unwrap();
     let config_directory = directory.path().join("network");
@@ -37,15 +40,35 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
     let mut network_config = ConfigBuilder::new(&config_directory)
         .committee_size(NonZeroUsize::new(4).unwrap())
         .with_epoch_duration(10_000)
+        .with_validator_observer_config(Arc::new(|index| {
+            (index == 0).then_some(ObserverParameters::default())
+        }))
         .build();
     let chain_id = network_config.genesis.checkpoint().digest().into_inner();
 
-    let validator_config = &mut network_config.validator_configs[0];
-    let validator_name = validator_config.protocol_public_key();
-    let signer_protocol = validator_config.protocol_key_pair().copy();
-    let signer_worker = validator_config.worker_key_pair().copy();
+    let source_config = &network_config.validator_configs[0];
+    let validator_name = source_config.protocol_public_key();
+    let signer_protocol = source_config.protocol_key_pair().copy();
+    let signer_worker = source_config.worker_key_pair().copy();
     let expected_protocol_public_key = hex::encode(signer_protocol.public().as_bytes());
     let expected_worker_public_key = hex::encode(signer_worker.public().as_bytes());
+    let observer_port = source_config
+        .consensus_config
+        .as_ref()
+        .unwrap()
+        .parameters
+        .as_ref()
+        .unwrap()
+        .observer
+        .server_port
+        .unwrap();
+    let observer_host = source_config.network_address.to_socket_addr().unwrap().ip();
+    let observer_peer = PeerRecord {
+        public_key: NetworkPublicKey::new(source_config.network_key_pair().public().clone()),
+        address: format!("/ip4/{observer_host}/udp/{observer_port}/http")
+            .parse()
+            .unwrap(),
+    };
 
     let (ca, ca_key) = certificate_authority();
     let server_identity = end_entity(
@@ -54,8 +77,14 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
         &ca,
         &ca_key,
     );
-    let validator_identity = end_entity(
+    let source_identity = end_entity(
         "validator-a",
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &ca,
+        &ca_key,
+    );
+    let target_identity = end_entity(
+        "validator-b",
         ExtendedKeyUsagePurpose::ClientAuth,
         &ca,
         &ca_key,
@@ -74,7 +103,7 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
     .unwrap();
     let signer_service = SignerService::new(
         SignerAccessPolicy::new(
-            BTreeSet::from([validator_identity.digest]),
+            BTreeSet::from([source_identity.digest, target_identity.digest]),
             BTreeSet::from([status_identity.digest]),
         )
         .unwrap(),
@@ -103,12 +132,21 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
             .unwrap();
     });
 
-    let validator_signer_config = signer_client_config(
+    let source_signer_config = signer_client_config(
         directory.path(),
-        "validator",
+        "validator-a",
         signer_address,
         &ca,
-        &validator_identity,
+        &source_identity,
+        &expected_protocol_public_key,
+        &expected_worker_public_key,
+    );
+    let target_signer_config = signer_client_config(
+        directory.path(),
+        "validator-b",
+        signer_address,
+        &ca,
+        &target_identity,
         &expected_protocol_public_key,
         &expected_worker_public_key,
     );
@@ -121,32 +159,77 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
         &expected_protocol_public_key,
         &expected_worker_public_key,
     );
-    validator_config.external_validator_signer = Some(validator_signer_config);
+    {
+        let source_config = &mut network_config.validator_configs[0];
+        source_config.external_validator_signer = Some(source_signer_config);
+        // Any accidental fallback to these unrelated local keys prevents this
+        // committee identity from making progress.
+        let (_, decoy_protocol) = get_authority_key_pair();
+        let (_, decoy_worker): (_, NetworkKeyPair) = get_key_pair();
+        source_config.protocol_key_pair = AuthorityKeyPairWithPath::new(decoy_protocol);
+        source_config.worker_key_pair = KeyPairWithPath::new(SuiKeyPair::Ed25519(decoy_worker));
+    }
+    let source_validator_profile = network_config.validator_configs[0].clone();
 
-    // If either local key path is touched after external signing is configured, the
-    // validator presents the wrong committee identity and this test cannot make progress.
-    let (_, decoy_protocol) = get_authority_key_pair();
-    let (_, decoy_worker): (_, NetworkKeyPair) = get_key_pair();
-    validator_config.protocol_key_pair = AuthorityKeyPairWithPath::new(decoy_protocol);
-    validator_config.worker_key_pair = KeyPairWithPath::new(SuiKeyPair::Ed25519(decoy_worker));
+    let observer_parameters = ObserverParameters {
+        peers: vec![observer_peer],
+        ..Default::default()
+    };
+    let target_observer_profile = FullnodeConfigBuilder::new()
+        .with_config_directory(config_directory.join("validator-b"))
+        .with_observer_config(observer_parameters.clone())
+        .build(&mut OsRng, &network_config);
+    let target_observer_name = target_observer_profile.protocol_public_key();
+    let source_observer_profile = FullnodeConfigBuilder::new()
+        .with_config_directory(config_directory.join("validator-a-observer"))
+        .with_db_path(source_validator_profile.db_path.clone())
+        .with_observer_config(observer_parameters)
+        .build(&mut OsRng, &network_config);
+
+    let mut target_validator_profile = source_validator_profile.clone();
+    target_validator_profile.external_validator_signer = Some(target_signer_config);
+    target_validator_profile.db_path = target_observer_profile.db_path.clone();
+    target_validator_profile
+        .consensus_config
+        .as_mut()
+        .unwrap()
+        .db_path = target_observer_profile
+        .consensus_config
+        .as_ref()
+        .unwrap()
+        .db_path
+        .clone();
 
     let mut swarm = Swarm::builder()
         .with_network_config(network_config)
+        .with_fullnode_config(target_observer_profile.clone())
         .with_fullnode_count(1)
         .build();
     swarm.launch().await.unwrap();
-    let validator = swarm.node(&validator_name).unwrap();
-    validator.health_check(true).await.unwrap();
+    let source = swarm.node(&validator_name).unwrap();
+    let target = swarm.node(&target_observer_name).unwrap();
+    source.health_check(true).await.unwrap();
+    target.health_check(false).await.unwrap();
+    assert_eq!(
+        target
+            .get_node_handle()
+            .unwrap()
+            .state()
+            .epoch_store_for_testing()
+            .node_role(),
+        sui_types::node_role::NodeRole::FullNode(FullNodeSyncMode::ConsensusObserver)
+    );
 
     let initial_generation = wait_for_signer_generation(
         &status_signer_config,
-        validator_identity.digest,
+        source_identity.digest,
         None,
         Duration::from_secs(10),
     )
     .await;
     let first_checkpoint =
-        wait_for_epoch_and_checkpoint(validator, 1, 2, Duration::from_secs(45)).await;
+        wait_for_epoch_and_checkpoint(source, 1, 2, Duration::from_secs(45)).await;
+    wait_for_epoch_and_checkpoint(target, 1, first_checkpoint, Duration::from_secs(30)).await;
 
     let mut status_client = SignerRpcClient::connect(&status_signer_config)
         .await
@@ -160,20 +243,74 @@ async fn committee_validator_runs_crosses_epoch_and_restarts_with_only_remote_si
         "the real Sui DKG never produced signer-owned randomness shares"
     );
 
-    validator.stop();
+    // A -> B: fence A, stop B's observer, and start B on the same on-chain
+    // validator identity with a separate signer client certificate and database.
+    source.stop();
     wait_for_no_lease(&mut status_client, Duration::from_secs(12)).await;
-    validator.start().await.unwrap();
-    validator.health_check(true).await.unwrap();
-    let restarted_generation = wait_for_signer_generation(
+    target.stop();
+    *target.config() = target_validator_profile;
+    target.start().await.unwrap();
+    target.health_check(true).await.unwrap();
+    let target_generation = wait_for_signer_generation(
         &status_signer_config,
-        validator_identity.digest,
+        target_identity.digest,
         Some(initial_generation),
         Duration::from_secs(12),
     )
     .await;
-    assert!(restarted_generation > initial_generation);
-    wait_for_epoch_and_checkpoint(validator, 1, first_checkpoint + 1, Duration::from_secs(20))
-        .await;
+    let target_checkpoint =
+        wait_for_epoch_and_checkpoint(target, 1, first_checkpoint + 1, Duration::from_secs(30))
+            .await;
+    assert!(target_generation > initial_generation);
+    assert!(
+        target
+            .get_node_handle()
+            .unwrap()
+            .state()
+            .epoch_store_for_testing()
+            .node_role()
+            .is_validator()
+    );
+
+    // A is demoted only after B is verified. It resumes from A's original
+    // authority database using independent observer keys and endpoints.
+    *source.config() = source_observer_profile;
+    source.start().await.unwrap();
+    source.health_check(false).await.unwrap();
+    wait_for_epoch_and_checkpoint(source, 1, target_checkpoint, Duration::from_secs(30)).await;
+    assert_eq!(
+        source
+            .get_node_handle()
+            .unwrap()
+            .state()
+            .epoch_store_for_testing()
+            .node_role(),
+        sui_types::node_role::NodeRole::FullNode(FullNodeSyncMode::ConsensusObserver)
+    );
+
+    // B -> A repeats the complete fence/switch/verify/demote sequence.
+    target.stop();
+    wait_for_no_lease(&mut status_client, Duration::from_secs(12)).await;
+    source.stop();
+    *source.config() = source_validator_profile;
+    source.start().await.unwrap();
+    source.health_check(true).await.unwrap();
+    let final_generation = wait_for_signer_generation(
+        &status_signer_config,
+        source_identity.digest,
+        Some(target_generation),
+        Duration::from_secs(12),
+    )
+    .await;
+    let final_checkpoint =
+        wait_for_epoch_and_checkpoint(source, 1, target_checkpoint + 1, Duration::from_secs(30))
+            .await;
+    assert!(final_generation > target_generation);
+
+    *target.config() = target_observer_profile;
+    target.start().await.unwrap();
+    target.health_check(false).await.unwrap();
+    wait_for_epoch_and_checkpoint(target, 1, final_checkpoint, Duration::from_secs(30)).await;
 
     signer_task.abort();
 }

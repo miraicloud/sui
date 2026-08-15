@@ -220,19 +220,21 @@ receives only a public DKG output; private shares remain in the signer across
 node restarts and lease transfer. Slow or unavailable signer calls run outside
 the randomness network event loop and retry without blocking its mailbox.
 
-The external signing path is exercised by a real four-validator local Sui
-swarm. The remotely signed validator has unrelated decoy protocol and worker
-keys in its local configuration, advances checkpoints, crosses an epoch,
-completes signer-owned randomness DKG, restarts, acquires a higher lease
-generation, and resumes checkpoint execution. A separate networked control
-plane test proves that a stale source process cannot sign after a fenced
-handoff.
+The external signing and candidate lifecycle are exercised by a real local Sui
+swarm with four validators and a separate consensus-observer candidate. The
+source and target have separate databases, profiles, and signer certificates;
+both validator profiles contain unrelated decoy protocol and worker keys. The
+test crosses an epoch, completes signer-owned randomness DKG, promotes the
+observer A-to-B, verifies committee and checkpoint progress, demotes A to the
+observer, then performs the complete B-to-A reverse handoff. Every activation
+acquires a strictly higher signer generation. A separate networked control
+plane test proves that a stale source credential cannot sign after the fence.
 
-Production-Testnet deployment remains gated on a two-real-node rehearsal,
-transport-key verification, pinned Linux artifacts, and a rehearsed rollback.
-A replicated or HSM-backed signer is a later availability and key-hardening
-stage; it must preserve exactly the same single-lease and durable decision
-semantics.
+Production-Testnet deployment remains gated on reproducing the round trip on
+the two real hosts, transport-key verification, pinned Linux artifacts, and
+explicit handling of the existing validator-key migration. A replicated or
+HSM-backed signer is a later availability and key-hardening stage; it must
+preserve exactly the same single-lease and durable decision semantics.
 
 The fork must not be used for a live validator merely because its individual
 signing paths compile. The complete failover test matrix is the release gate.

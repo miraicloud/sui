@@ -235,13 +235,16 @@ advance validator metrics. A final signing attempt using the source's stale
 credential must receive `PermissionDenied` from the signer.
 
 This proves the networked stop/fence/start path and stale-holder rejection. It
-is complemented by a real four-validator local Sui swarm test in which one
-committee validator has only remote protocol and worker signing authority. That
-validator executes checkpoints, crosses an epoch, completes signer-owned DKG,
-restarts, acquires a higher lease generation, and resumes progress while its
-configured local keys are unrelated decoys.
+is complemented by a real local Sui swarm test with four validators and a
+separate consensus-observer candidate. With independent databases, profiles,
+and signer certificates, that test crosses an epoch and completes signer-owned
+DKG, performs A-to-B, verifies the new committee validator, demotes A to the
+observer, then performs the complete B-to-A reverse handoff. Both validator
+profiles contain unrelated decoy protocol and worker keys, and every activation
+requires a strictly higher signer generation.
 
 Together these tests cover the real Sui signing paths and the networked
-stop/fence/start orchestration. They do not replace the release-gate drill with
-two real `sui-node` processes, Testnet traffic, host/process failures, and a
-rehearsed rollback.
+candidate lifecycle plus the networked stop/fence/start orchestration. They do
+not replace the release-gate drill on the two real Testnet hosts with pinned
+Linux artifacts, host/process failure injection, and the existing validator
+keys under explicit operator control.

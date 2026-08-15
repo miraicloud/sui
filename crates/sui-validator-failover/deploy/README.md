@@ -79,12 +79,15 @@ lease generation, key identities, epoch, DKG state, voting roles, and lag bounds
 are eligible. It never calls a stop, start, profile activation, lease, or
 signing method.
 
-The real local Sui swarm test already exercises remote authority and worker
-signing, checkpoint progress, an epoch transition, signer-owned DKG, and a
-higher lease generation after restart. The networked controller test separately
-exercises mutual TLS, stop/fence/start ordering, and stale-holder rejection.
+The real local Sui swarm test already exercises the complete A-to-B-to-A
+candidate lifecycle with a consensus observer, separate databases, profiles,
+and signer certificates, checkpoint progress, an epoch transition,
+signer-owned DKG, demotion back to observer, and strictly increasing lease
+generations. The networked controller test separately exercises mutual TLS,
+stop/fence/start ordering, and stale-holder rejection.
 
-The first live Testnet handoff remains gated on the two-real-node rehearsal,
-pinned Linux artifact manifest, rollback rehearsal, and explicit operator
-handling of the existing validator key migration. Never discover, copy, or
-relocate those private keys as an unattended deployment step.
+The first live Testnet handoff remains gated on reproducing that round trip on
+the two real hosts, a pinned Linux artifact manifest, host/process failure
+injection, and explicit operator handling of the existing validator key
+migration. Never discover, copy, or relocate those private keys as an unattended
+deployment step.
