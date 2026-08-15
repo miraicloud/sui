@@ -89,7 +89,16 @@ impl SignerService {
     ) -> Result<ResponseV1, ServiceError> {
         match request {
             RequestV1::GetPublicKeys => Ok(self.keys.public_keys()),
-            RequestV1::GetStatus => Ok(ResponseV1::Status(self.policy.status()?)),
+            RequestV1::GetStatus => {
+                let mut status = self.policy.status()?;
+                status.randomness_sessions = self
+                    .randomness
+                    .statuses()?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                Ok(ResponseV1::Status(status))
+            }
             RequestV1::AcquireLease { ttl_ms } => {
                 Ok(ResponseV1::Lease(self.policy.acquire(holder_id, ttl_ms)?))
             }

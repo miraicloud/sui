@@ -144,23 +144,72 @@ There is no automatic fallback from external signing to key files. Such a
 fallback would bypass the fence during the exact failure mode it is meant to
 contain.
 
-## Delivery stages
+## Configuration
 
-1. Introduce a versioned protocol, signer service, durable lease journal, and
-   policy tests without changing the default node path.
-2. Route authority BLS and Mysticeti worker signatures through signer traits
-   and add fail-closed lease handling.
-3. Move DKG state and randomness-share signing into the service.
-4. Exercise two warm nodes against one signer through partitions, delayed
-   requests, crashes, restarts, and forced lease transfer.
-5. Add a replicated or HSM-backed signer deployment only after the
-   single-signer safety model passes adversarial tests.
+Run the signer on a separate failure domain from both validator candidates.
+The protocol and worker private keys exist only on that host. The signer state
+directory and every private key must be owned by the signer service account and
+must not be accessible by group or other users.
 
-The fork is not ready for a live validator until all key-coverage stages and
-the failover test matrix pass. Partial externalization must not be presented as
-private-key isolation.
+```yaml
+# /etc/sui/validator-signer.yaml
+listen-address: "0.0.0.0:19000"
+state-path: /var/lib/sui-validator-signer/policy.journal
+randomness-state-path: /var/lib/sui-validator-signer/randomness.bcs
+protocol-key-path: /etc/sui-validator-signer/protocol.key
+worker-key-path: /etc/sui-validator-signer/worker.key
+chain-id: "<64 lowercase hex characters>"
+max-lease-ttl-ms: 10000
+max-payload-bytes: 4194304
+tls:
+  certificate-path: /etc/sui-validator-signer/tls/server.crt
+  private-key-path: /etc/sui-validator-signer/tls/server.key
+  client-ca-path: /etc/sui-validator-signer/tls/client-ca.crt
+```
 
-During stage 2, an externally signed validator follows randomness DKG as an
-observer and does not contribute a DKG message or randomness partial
-signatures. This avoids reintroducing the local protocol secret, but reduces
-the committee's randomness fault margin and is not the final deployment mode.
+Each candidate receives a different client certificate. That certificate's
+DER digest is its lease holder ID, so the control plane can map the signer
+status back to an exact host. The node configuration contains public keys and
+the client transport credential, but no protocol or worker private key:
+
+```yaml
+external-validator-signer:
+  endpoint: "https://validator-signer.internal:19000"
+  server-name: validator-signer.internal
+  ca-certificate-path: /etc/sui/signer-tls/ca.crt
+  client-certificate-path: /etc/sui/signer-tls/validator-a.crt
+  client-private-key-path: /etc/sui/signer-tls/validator-a.key
+  expected-protocol-public-key: "<192 lowercase hex characters>"
+  expected-worker-public-key: "<64 lowercase hex characters>"
+  request-timeout-ms: 1000
+  lease-ttl-ms: 5000
+```
+
+The transport network key is still file-backed. Both candidates need the same
+on-chain network identity for an immediate handoff, but it is not a slashable
+signing key. Keep its file sealed and readable only by `sui-node`; the host
+agent must stop the source and verify signer lease fencing before starting the
+target. Externalizing TLS/network signing remains a separate hardening stage.
+
+`GET_STATUS` is mTLS-authenticated but does not require a lease. It reports the
+signer's own observation time, only an effective unexpired lease, the next
+generation, durable decision count, and every retained DKG session including
+whether randomness shares are ready. Operator code must use the signer-owned
+observation time rather than assuming its own wall clock is authoritative.
+
+## Implementation status
+
+The fork currently implements the versioned mTLS protocol, durable lease and
+anti-equivocation journal, authority BLS signing, Mysticeti worker signing,
+signer-owned DKG state, and lease-fenced randomness partial signing. The node
+receives only a public DKG output; private shares remain in the signer across
+node restarts and lease transfer. Slow or unavailable signer calls run outside
+the randomness network event loop and retry without blocking its mailbox.
+
+Production-Testnet deployment remains gated on the host agent, transport-key
+fencing, two-node adversarial tests, packaging, and a rehearsed rollback. A
+replicated or HSM-backed signer is a later availability and key-hardening stage;
+it must preserve exactly the same single-lease and durable decision semantics.
+
+The fork must not be used for a live validator merely because its individual
+signing paths compile. The complete failover test matrix is the release gate.

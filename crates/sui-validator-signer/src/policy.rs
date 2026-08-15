@@ -310,16 +310,24 @@ impl<S: StateStore, C: Clock> SignerPolicy<S, C> {
     }
 
     pub fn status(&self) -> Result<SignerStatus, PolicyError> {
+        let now = self.clock.unix_ms()?;
         let state = self.state.lock().map_err(|_| PolicyError::LockPoisoned)?;
+        validate_time(&state, now)?;
         Ok(SignerStatus {
-            current_lease: state.current_lease.as_ref().map(|lease| LeaseStatus {
-                holder_id: lease.holder_id,
-                generation: lease.generation,
-                expires_at_unix_ms: lease.expires_at_unix_ms,
-            }),
+            current_lease: state
+                .current_lease
+                .as_ref()
+                .filter(|lease| lease.expires_at_unix_ms > now)
+                .map(|lease| LeaseStatus {
+                    holder_id: lease.holder_id,
+                    generation: lease.generation,
+                    expires_at_unix_ms: lease.expires_at_unix_ms,
+                }),
             next_generation: state.next_generation,
+            observed_at_unix_ms: now,
             last_seen_unix_ms: state.last_seen_unix_ms,
             decision_count: state.decisions.len() as u64,
+            randomness_sessions: Vec::new(),
         })
     }
 
@@ -613,7 +621,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let clock = TestClock::default();
         clock.set(100);
-        let policy = policy(&directory, clock);
+        let policy = policy(&directory, clock.clone());
 
         let first = policy.acquire(holder(1), 1_000).unwrap();
         let error = policy.acquire(holder(2), 1_000).unwrap_err();
@@ -624,8 +632,12 @@ mod tests {
         assert_eq!(first.generation, 1);
         let status = policy.status().unwrap();
         assert_eq!(status.next_generation, 2);
+        assert_eq!(status.observed_at_unix_ms, 100);
         assert_eq!(status.decision_count, 0);
         assert_eq!(status.current_lease.unwrap().holder_id, holder(1));
+
+        clock.set(1_100);
+        assert!(policy.status().unwrap().current_lease.is_none());
     }
 
     #[test]

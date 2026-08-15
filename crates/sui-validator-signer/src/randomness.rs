@@ -275,6 +275,18 @@ impl<S: RandomnessStateStore> RandomnessSessionManager<S> {
             .status(epoch))
     }
 
+    pub fn statuses(&self) -> Result<Vec<DkgSessionStatus>, RandomnessError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RandomnessError::LockPoisoned)?;
+        Ok(state
+            .sessions
+            .iter()
+            .map(|(epoch, session)| session.status(*epoch))
+            .collect())
+    }
+
     pub fn create_message(&self, epoch: u64) -> Result<Vec<u8>, RandomnessError> {
         self.mutate_session(epoch, |session| {
             if let Some(message) = &session.local_message {

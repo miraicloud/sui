@@ -29,8 +29,10 @@ pub struct LeaseCredential {
 pub struct SignerStatus {
     pub current_lease: Option<LeaseStatus>,
     pub next_generation: u64,
+    pub observed_at_unix_ms: u64,
     pub last_seen_unix_ms: u64,
     pub decision_count: u64,
+    pub randomness_sessions: Vec<DkgSessionStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

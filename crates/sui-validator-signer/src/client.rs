@@ -541,6 +541,10 @@ mod tests {
             message_response,
             RandomnessDkgResponse::Message(_)
         ));
+        let status = client.get_status().await.unwrap();
+        assert_eq!(status.randomness_sessions.len(), 1);
+        assert_eq!(status.randomness_sessions[0].epoch, 1);
+        assert!(!status.randomness_sessions[0].shares_ready);
         let mut payload = bcs::to_bytes(&IntentMessage::new(
             Intent::sui_app(IntentScope::TransactionEffects),
             TransactionEffects::default(),

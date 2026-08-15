@@ -56,14 +56,13 @@ The comparison view must show at least:
 - protocol, worker, and network public-key fingerprints;
 - signer lease holder, generation, and signer-owned expiry;
 - voting right and current committee identity;
-- randomness DKG status and whether local randomness shares are available; and
+- signer-owned randomness DKG status and whether shares are ready; and
 - time synchronization, disk space, database health, and recent crash loops.
 
 Promotion is disabled when identity fingerprints differ, the backup is outside
 configured lag bounds, its database is unhealthy, the signer is unavailable,
-or a different promotion operation is already in progress. The stage-2
-randomness-observer limitation is displayed as a degraded readiness condition,
-not hidden.
+or a different promotion operation is already in progress. A missing or
+incomplete signer-owned DKG session is a hard readiness failure, not a warning.
 
 ## Fenced promotion
 
