@@ -28,5 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
       - uses: taiki-e/install-action@protoc
+      - name: Prove fail-closed control-state invariants
+        run: cargo test -p sui-validator-failover
       - name: Prove fenced local-key failover
         run: cargo test -p sui-swarm --test local_validator_failover

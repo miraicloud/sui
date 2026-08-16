@@ -17618,6 +17618,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-validator-failover"
+version = "1.77.2"
+
+[[package]]
 name = "sui-verifier-latest"
 version = "0.1.0"
 dependencies = [
