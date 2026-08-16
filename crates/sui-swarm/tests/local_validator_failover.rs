@@ -112,6 +112,15 @@ async fn fenced_local_keys_support_reversible_mid_epoch_handoff() {
         value == 1.0
     })
     .await;
+    // The in-memory DKG completion signal can precede checkpoint certification
+    // and the consensus-quarantine write. Promotion readiness must require the
+    // observer transcript to be durable, not merely complete in memory.
+    wait_for_metric(
+        target,
+        "epoch_random_beacon_dkg_output_persisted",
+        |value| value == 1.0,
+    )
+    .await;
     assert_eq!(metric(target, "current_voting_right").await, 0.0);
     assert_eq!(
         metric(target, "epoch_random_beacon_signer_ready").await,

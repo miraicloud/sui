@@ -555,7 +555,7 @@ impl ConsensusOutputQuarantine {
 
         // we may already have observed the certified checkpoint for this round, if state sync is running
         // ahead of consensus, so there may be data to commit right away.
-        self.commit(epoch_store)
+        self.commit(epoch_store).map(|_| ())
     }
 
     // Record a newly built checkpoint.
@@ -579,16 +579,17 @@ impl ConsensusOutputQuarantine {
         checkpoint: CheckpointSequenceNumber,
         epoch_store: &AuthorityPerEpochStore,
         batch: &mut DBBatch,
-    ) -> SuiResult {
+    ) -> SuiResult<bool> {
         self.highest_executed_checkpoint = checkpoint;
         self.commit_with_batch(epoch_store, batch)
     }
 
-    pub(super) fn commit(&mut self, epoch_store: &AuthorityPerEpochStore) -> SuiResult {
+    pub(super) fn commit(&mut self, epoch_store: &AuthorityPerEpochStore) -> SuiResult<bool> {
         let mut batch = epoch_store.db_batch()?;
-        self.commit_with_batch(epoch_store, &mut batch)?;
+        let persisted_successful_dkg_output = self.commit_with_batch(epoch_store, &mut batch)?;
         batch.write()?;
-        Ok(())
+        self.mark_dkg_output_persisted(persisted_successful_dkg_output);
+        Ok(persisted_successful_dkg_output)
     }
 
     /// Commit all data below the watermark.
@@ -596,7 +597,7 @@ impl ConsensusOutputQuarantine {
         &mut self,
         epoch_store: &AuthorityPerEpochStore,
         batch: &mut DBBatch,
-    ) -> SuiResult {
+    ) -> SuiResult<bool> {
         // The commit algorithm is simple:
         // 1. First commit all checkpoint builder state which is below the watermark.
         // 2. Determine the consensus commit height that corresponds to the highest committed
@@ -606,6 +607,7 @@ impl ConsensusOutputQuarantine {
         let tables = epoch_store.tables()?;
 
         let mut highest_committed_height = None;
+        let mut persisted_successful_dkg_output = false;
 
         while self
             .builder_checkpoint_summary
@@ -636,7 +638,7 @@ impl ConsensusOutputQuarantine {
         }
 
         let Some(highest_committed_height) = highest_committed_height else {
-            return Ok(());
+            return Ok(false);
         };
 
         // Only commit outputs up to the last one where the checkpoint queue
@@ -660,6 +662,7 @@ impl ConsensusOutputQuarantine {
         if let Some(idx) = last_drain_idx {
             for _ in 0..=idx {
                 let output = self.output_queue.pop_front().unwrap();
+                persisted_successful_dkg_output |= matches!(&output.dkg_output, Some(Some(_)));
                 self.remove_shared_object_next_versions(&output);
                 self.remove_processed_consensus_messages(&output);
                 self.remove_congestion_control_debts(&output);
@@ -672,7 +675,13 @@ impl ConsensusOutputQuarantine {
             .consensus_quarantine_queue_size
             .set(self.output_queue.len() as i64);
 
-        Ok(())
+        Ok(persisted_successful_dkg_output)
+    }
+
+    pub(super) fn mark_dkg_output_persisted(&self, persisted: bool) {
+        if persisted {
+            self.metrics.epoch_random_beacon_dkg_output_persisted.set(1);
+        }
     }
 }
 

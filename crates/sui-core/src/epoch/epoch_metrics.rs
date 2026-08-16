@@ -96,6 +96,9 @@ pub struct EpochMetrics {
     /// Whether validated local shares have been installed in the randomness network.
     pub epoch_random_beacon_signer_ready: IntGauge,
 
+    /// Whether a successful DKG output has crossed the consensus quarantine and is durable.
+    pub epoch_random_beacon_dkg_output_persisted: IntGauge,
+
     /// The amount of time taken from epoch start to completion of random beacon DKG protocol,
     /// for the most recent epoch.
     pub epoch_random_beacon_dkg_epoch_start_completion_time_ms: IntGauge,
@@ -257,6 +260,12 @@ impl EpochMetrics {
             epoch_random_beacon_signer_ready: register_int_gauge_with_registry!(
                 "epoch_random_beacon_signer_ready",
                 "Whether validated local random beacon shares have been installed in the randomness network",
+                registry
+            )
+            .unwrap(),
+            epoch_random_beacon_dkg_output_persisted: register_int_gauge_with_registry!(
+                "epoch_random_beacon_dkg_output_persisted",
+                "Whether a successful random beacon DKG output has crossed the consensus quarantine and is durable",
                 registry
             )
             .unwrap(),

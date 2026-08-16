@@ -2018,8 +2018,10 @@ impl AuthorityPerEpochStore {
         let seq = *checkpoint.sequence_number();
 
         let mut quarantine = self.consensus_quarantine.write();
-        quarantine.update_highest_executed_checkpoint(seq, self, &mut batch)?;
+        let persisted_successful_dkg_output =
+            quarantine.update_highest_executed_checkpoint(seq, self, &mut batch)?;
         batch.write()?;
+        quarantine.mark_dkg_output_persisted(persisted_successful_dkg_output);
 
         for digest in digests {
             self.signed_effects_digests_cache.remove(digest);

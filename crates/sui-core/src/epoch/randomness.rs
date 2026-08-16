@@ -556,6 +556,10 @@ impl RandomnessManager {
             .epoch_random_beacon_recovered_shares
             .set(0);
         epoch_store.metrics.epoch_random_beacon_signer_ready.set(0);
+        epoch_store
+            .metrics
+            .epoch_random_beacon_dkg_output_persisted
+            .set(0);
 
         let committee = epoch_store.committee();
         let info = RandomnessManager::randomness_dkg_info_from_committee(committee);
@@ -667,6 +671,10 @@ impl RandomnessManager {
             .dkg_output_v2
             .get(&SINGLETON_KEY)
             .expect("typed_store should not fail");
+        epoch_store
+            .metrics
+            .epoch_random_beacon_dkg_output_persisted
+            .set(matches!(&dkg_output, Some(Some(_))) as i64);
         match dkg_output {
             Some(Some(mut dkg_output)) => {
                 if rm.role.is_party() && dkg_output.shares.is_none() {
